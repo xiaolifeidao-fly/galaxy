@@ -55,6 +55,16 @@ export interface CapabilityReport {
   provider: string;
   available: boolean;
   unavailableReason?: string;
+  /**
+   * 上游可用的模型名。控制台拿它当「只放/不放这些模型」的候选项。
+   *
+   * 走 hello 而不是让浏览器直连本机 bridge：贡献授权页管的是主人名下**所有**机器，
+   * 而浏览器只够得到自己坐着这台。用台式机配笔记本上那条贡献时没有 bridge 可调。
+   *
+   * 字段名不能叫 models：Hub 的 ContributionInput 上已经有一个 models，而且是
+   * `{allow, deny}` 对象 —— 发数组过去反序列化直接失败，整个 hello 就挂了。
+   */
+  availableModels?: string[];
 }
 
 /**

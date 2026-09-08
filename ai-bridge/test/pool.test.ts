@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { parseConfig } from "../src/config/index.js";
 import { Lane } from "../src/modules/pool/lane.js";
 import { sleep } from "../src/modules/pool/runner.js";
+import { parseModels } from "../src/modules/pool/models.js";
 import { modelMatch, inlineJSON, inlineText, type WorkUnit } from "../src/business/core/index.js";
 import type { ContributionDeclaration } from "../src/modules/pool/client.js";
 import type { Provider } from "../src/business/core/index.js";
@@ -226,4 +227,34 @@ test("sleep 的定时器必须保活事件循环", async () => {
   const pending = sleep(30);
   assert.equal(count(), before + 1, "sleep 的定时器没有保活事件循环（多半是又被 unref 了）");
   await pending;
+});
+
+// ---------- 上游模型清单解析 ----------
+//
+// 这份清单会变成控制台里「只放这些模型」的候选项。解析错了不会报错、只会安静地
+// 少几个候选或者多出垃圾项，而主人会照着垃圾项配出一条永远匹配不上的规则。
+
+test("认 OpenAI / Anthropic 的 {data:[{id}]} 形状", () => {
+  const models = parseModels({ data: [{ id: "claude-opus-4" }, { id: "claude-sonnet-4" }] });
+  assert.deepEqual(models, ["claude-opus-4", "claude-sonnet-4"]);
+});
+
+test("也认少数网关的 {models:[\"...\"]} 形状", () => {
+  assert.deepEqual(parseModels({ models: ["gpt-a", "gpt-b"] }), ["gpt-a", "gpt-b"]);
+});
+
+test("去重并排序：同一个模型在分页结果里出现两次不该变成两个候选", () => {
+  assert.deepEqual(parseModels({ data: [{ id: "b" }, { id: "a" }, { id: "b" }] }), ["a", "b"]);
+});
+
+test("认不出来的形状一律当空，不猜", () => {
+  // 猜错的模型名比没有更糟：主人会照着它配出一条永远匹配不上的规则，
+  // 然后以为是共享池坏了。
+  for (const junk of [null, undefined, {}, { data: "nope" }, { data: [1, 2] }, "text", []]) {
+    assert.deepEqual(parseModels(junk), [], `不该从 ${JSON.stringify(junk)} 解析出模型`);
+  }
+});
+
+test("丢掉空串和非字符串的 id", () => {
+  assert.deepEqual(parseModels({ data: [{ id: "" }, { id: "  " }, { id: 5 }, { id: "ok" }] }), ["ok"]);
 });

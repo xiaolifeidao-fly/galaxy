@@ -17,6 +17,7 @@ import {
   type CapabilityReport, type EnabledContribution, type NextResult,
 } from "./client.js";
 import { Lane, type LaneConfig } from "./lane.js";
+import { listModels } from "./models.js";
 import { localResources, probe } from "./probe.js";
 import { fingerprint, readNodeIdentity, resolveNodeTokenFile } from "./token.js";
 
@@ -72,10 +73,19 @@ export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
       const local = localCapability(capability, cfg, credentials);
       if (!local) continue;
       next.set(local.cid, local);
+      // 只给「可用」的能力列模型：不可用时凭据本来就解析不了，去问上游只是白等一次超时。
+      // listModels 自己带 6 小时缓存，所以 hello 再频繁也不会变成对上游的压力。
+      const upstream = capability.upstream;
+      const provider = upstream ? cfg.providers[upstream] : undefined;
+      const models =
+        capability.available && upstream && provider
+          ? await listModels(upstream, provider, credentials)
+          : undefined;
       reports.push({
         cid: local.cid, kind: local.kind, kindVersion: local.kindVersion, provider: local.routeKey,
         available: capability.available,
         unavailableReason: capability.available ? undefined : capability.detail,
+        ...(models?.length ? { availableModels: models } : {}),
       });
       if (!capability.available) {
         log.warn("pool_upstream_unavailable", { cid: local.cid, detail: capability.detail });

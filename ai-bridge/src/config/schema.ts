@@ -21,6 +21,9 @@ export const ProviderConfigSchema = z.object({
   authFile: z.string().optional(),
   // claude_oauth：自定义 Claude 配置目录时可显式指定 Keychain service；authFile 优先于自动发现
   claudeKeychainService: z.string().min(1).optional(),
+  // 上游可用的模型清单。写了就以它为准、不去打上游的 /models；
+  // 用于那些没有 models 端点的上游（如 Codex 的 chatgpt.com/backend-api/codex）。
+  models: z.array(z.string().min(1)).optional(),
   // 仅作用于该 provider 的并发上限；不填走全局
   concurrency: z.number().int().positive().optional(),
   queueMaxSize: z.number().int().positive().optional(),
