@@ -146,7 +146,14 @@ export const PoolExecSchema = z.object({
   timeoutMs: z.number().int().positive().optional(),
 });
 
-// 一条贡献 = 主人勾选出去共享的一种能力。探测到的能力不等于贡献（P-02 / P-03）。
+// 一条贡献 = 主人勾选出去共享的一种能力。
+//
+// **这一段已经不再决定任何事。** 共享哪几种、共享多少、座位、模型范围、挂机时段，
+// 现在全部由主人在 Galaxy 控制台的「贡献授权」里定，Hub 每次 hello / 心跳下发一份
+// 生效配置，节点照着建通道。留着这个 schema 是为了让老配置文件还能解析通过，
+// 以及 pool status 还能打印出来看 —— 但节点启动时不会再读它。
+//
+// 这么改的理由：主人想调整时不该被逼回到那台机器上。
 export const PoolContributionSchema = z.object({
   id: z.string().min(1).regex(/^[A-Za-z0-9_.:-]+$/),
   kind: z.string().min(1).default("llm.chat"),

@@ -12,9 +12,12 @@ import {
 import { RelayProvider } from "../../business/llm-chat/node/relay-provider.js";
 import { PlannerBridgeProvider } from "../../business/delivery-task/node/planner-bridge.js";
 import { FfmpegLocalProvider } from "../../business/video-edit/node/ffmpeg-local.js";
-import { ContractMismatchError, HubClient, type ContributionDeclaration, type NextResult } from "./client.js";
-import { Lane } from "./lane.js";
-import { localResources } from "./probe.js";
+import {
+  ContractMismatchError, HubClient,
+  type CapabilityReport, type EnabledContribution, type NextResult,
+} from "./client.js";
+import { Lane, type LaneConfig } from "./lane.js";
+import { localResources, probe } from "./probe.js";
 import { fingerprint, readNodeIdentity, resolveNodeTokenFile } from "./token.js";
 
 // pool 模式的运行循环。
@@ -45,45 +48,108 @@ export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
   const client = new HubClient(settings.hubURL, settings.contract, identity.token, identity.nodeId);
   const credentials = new CredentialRegistry();
 
-  // 只装载被贡献到的 provider：主人没勾的能力，代码都不加载（X-03）。
+  // 通道是**跟着 Hub 下发的集合动态增删的**，不是启动时按本地配置建好的。
+  //
+  // 「共享哪几种、共享多少」现在由主人在控制台定，Hub 每次 hello / 心跳带回来一份
+  // 生效配置，这里照着对齐。本机配置文件里的 pool.contributions 不再参与决策 ——
+  // 主人想改设置不必回到这台机器，改完最迟一个心跳周期就生效。
   const lanes = new Map<string, Lane>();
-  for (const contribution of settings.contributions) {
-    if (!contribution.enabled) continue;
-    const routeKey = routeProvider(contribution, cfg);
-    if (!routeKey) continue;
-    const provider = buildProvider(contribution, routeKey, cfg, credentials);
-    lanes.set(contribution.id, new Lane(contribution, declare(contribution, routeKey), provider));
-  }
-  if (lanes.size === 0) throw new Error("没有任何启用的贡献");
+  // inventory 是本机探测到的能力，cid → 建 provider 需要的本地信息。
+  // 它决定「能不能建这条通道」，Hub 决定「要不要建」。
+  let inventory = new Map<string, LocalCapability>();
 
   const aborts = new Map<string, AbortController>();
   let stopping = false;
   let loopSignal = new AbortController();
 
-  async function sayHello(): Promise<void> {
-    // 贡献里有凭据坏掉的，先探一次，别把一条注定失败的通道申报上去。
-    for (const lane of lanes.values()) {
-      const result = await lane.provider.probe();
-      lane.upstreamOK = result.upstreamOK;
-      lane.declaration.upstreamOK = result.upstreamOK;
-      if (!result.upstreamOK) {
-        log.warn("pool_upstream_unavailable", { cid: lane.cid, detail: result.detail });
+  // refreshInventory 重新探一遍本机能力。凭据会过期、ffmpeg 会被卸载，
+  // 所以每次 hello 都探，不只探一次。
+  async function refreshInventory(): Promise<CapabilityReport[]> {
+    const probed = await probe(cfg);
+    const next = new Map<string, LocalCapability>();
+    const reports: CapabilityReport[] = [];
+    for (const capability of probed.capabilities) {
+      const local = localCapability(capability, cfg, credentials);
+      if (!local) continue;
+      next.set(local.cid, local);
+      reports.push({
+        cid: local.cid, kind: local.kind, kindVersion: local.kindVersion, provider: local.routeKey,
+        available: capability.available,
+        unavailableReason: capability.available ? undefined : capability.detail,
+      });
+      if (!capability.available) {
+        log.warn("pool_upstream_unavailable", { cid: local.cid, detail: capability.detail });
       }
     }
+    inventory = next;
+    return reports;
+  }
+
+  /**
+   * applyEnabled 把本地通道对齐到 Hub 下发的集合。
+   *
+   * 三种情形分开处理：
+   *   新增 —— Hub 要，本地没有：建通道（本机得真有这个能力，否则只记一条日志）
+   *   变更 —— 两边都有：**原地换配置**，不重建。重建会把 inflight 计数清零，
+   *           正在跑的请求就变成了「没人认领的并发」，闸门当场失准。
+   *   移除 —— Hub 不要了（主人关掉了）：先置 draining 停止接新单，
+   *           等在跑的跑完再真拆。直接删会把跑到一半的请求连同 abort 控制器一起丢掉。
+   */
+  function applyEnabled(enabled: EnabledContribution[] | undefined): void {
+    // undefined 表示对面是老版本 Hub，没有这个字段 —— 维持现状。
+    // 空数组才是「一条都别跑」。两者混同会让一次版本不匹配把所有通道停掉。
+    if (!enabled) return;
+    const wanted = new Map(enabled.map((item) => [item.cid, item]));
+
+    for (const [cid, want] of wanted) {
+      const local = inventory.get(cid);
+      if (!local) {
+        log.warn("pool_enabled_not_probed", { cid, hint: "控制台开着这条贡献，但本机没探测到这个能力" });
+        continue;
+      }
+      const config = laneConfig(want);
+      const existing = lanes.get(cid);
+      if (existing) {
+        existing.config = config;
+        continue;
+      }
+      lanes.set(cid, new Lane(config, local.build()));
+      log.info("pool_lane_added", { cid, kind: want.kind, seats: want.seats });
+    }
+
+    for (const [cid, lane] of [...lanes]) {
+      if (wanted.has(cid)) continue;
+      lane.draining = true;
+      if (lane.inflight === 0) {
+        lanes.delete(cid);
+        log.info("pool_lane_removed", { cid });
+      } else {
+        log.info("pool_lane_draining", { cid, inflight: lane.inflight });
+      }
+    }
+  }
+
+  async function sayHello(): Promise<void> {
+    const reports = await refreshInventory();
     const result = await client.hello({
       bridgeVersion,
       contract: settings.contract,
       resources: localResources(),
-      contributions: [...lanes.values()].map((lane) => lane.declaration),
+      contributions: reports,
     });
     for (const rejected of result.rejected ?? []) {
-      log.error("pool_contribution_rejected", { cid: rejected.cid, reason: rejected.reason });
-      lanes.delete(rejected.cid);
+      log.error("pool_capability_rejected", { cid: rejected.cid, reason: rejected.reason });
     }
+    applyEnabled(result.enabled);
     log.info("pool_hello", {
       nodeId: identity.nodeId, token: fingerprint(identity.token),
-      accepted: result.accepted, hub: settings.hubURL,
+      probed: reports.length, enabled: lanes.size, hub: settings.hubURL,
     });
+    if (lanes.size === 0) {
+      log.warn("pool_nothing_enabled", {
+        hint: "本机没有任何通道在跑：去控制台的「贡献授权」把要共享的能力打开并给上额度",
+      });
+    }
   }
 
   async function heartbeatLoop(): Promise<void> {
@@ -105,6 +171,10 @@ export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
         for (const lane of lanes.values()) {
           lane.draining = draining.has(lane.cid);
         }
+        // 主人在控制台改了什么，最迟一个心跳周期就换过来 ——「随时随地能调」
+        // 就是这一行。注意它在 draining 之后：applyEnabled 会把被关掉的通道
+        // 重新置成 draining，顺序反了会被上面那个循环立刻清掉。
+        applyEnabled(result.enabled);
       } catch (e) {
         log.warn("pool_heartbeat_failed", { message: (e as Error)?.message });
       }
@@ -285,7 +355,7 @@ export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
   function resolveLane(unit: WorkUnit): Lane | undefined {
     for (const lane of lanes.values()) {
       if (lane.config.kind !== unit.kind || lane.config.kindVersion !== unit.kindVersion) continue;
-      if (lane.declaration.provider !== unit.provider) continue;
+      if (lane.config.provider !== unit.provider) continue;
       if (unit.model && !modelMatch(unit.model, lane.config.models.allow, lane.config.models.deny)) continue;
       return lane;
     }
@@ -401,21 +471,67 @@ function buildProvider(
   }
 }
 
-function declare(contribution: PoolContribution, routeKey: string): ContributionDeclaration {
+/**
+ * LocalCapability 是本机对一项能力知道、而 Hub 不知道的那部分：
+ * 拿哪一份订阅登录态、跑哪个可执行文件。Hub 只发「要不要、给多少」，
+ * 「怎么跑」永远留在本机 —— 凭据不出本机这条就靠它。
+ */
+interface LocalCapability {
+  cid: string;
+  kind: string;
+  kindVersion: number;
+  /** routeKey 是放置用的 provider 路由键（中转类由订阅类型推出，本机执行类是模块名）。 */
+  routeKey: string;
+  /** build 惰性建执行器：Hub 没开启的能力不会被调用，相关代码也就不加载（X-03）。 */
+  build: () => Provider;
+}
+
+/**
+ * localCapability 把一条探测结果映射成「本机怎么跑它」。
+ *
+ * cid 用配置键（中转类）或模块名（本机执行类）：它要在这台机器上唯一，
+ * 而且要能在控制台上被主人认出来。Hub 侧会再加 nodeId 前缀消歧（设计 2.7）。
+ *
+ * kindVersion 固定 1：适配器目前都是 v1，探测结果里没有这一项。
+ * 将来出现 v2 时这里要跟着改，否则会把 v2 的能力报成 v1。
+ */
+function localCapability(
+  capability: { kind: string; provider: string; upstream?: string },
+  cfg: AppConfig,
+  credentials: CredentialRegistry,
+): LocalCapability | undefined {
+  const kindVersion = 1;
+  switch (capability.kind) {
+    case "llm.chat": {
+      const upstream = capability.upstream;
+      if (!upstream || !cfg.providers[upstream]) return undefined;
+      return {
+        cid: upstream, kind: capability.kind, kindVersion, routeKey: capability.provider,
+        build: () => new RelayProvider({
+          name: capability.provider, provider: cfg.providers[upstream], credentials,
+        }),
+      };
+    }
+    case "video.edit.render":
+      return {
+        cid: capability.provider, kind: capability.kind, kindVersion, routeKey: capability.provider,
+        build: () => new FfmpegLocalProvider({ name: capability.provider }),
+      };
+    default:
+      // delivery.task 不在这里：它的执行器是主人自己写的命令，探测不出来。
+      return undefined;
+  }
+}
+
+function laneConfig(want: EnabledContribution): LaneConfig {
   return {
-    cid: contribution.id,
-    kind: contribution.kind,
-    kindVersion: contribution.kindVersion,
-    provider: routeKey,
-    models: { allow: contribution.models.allow, deny: contribution.models.deny },
-    seats: contribution.seats,
-    seatConcurrency: contribution.seatConcurrency,
-    quota: contribution.quota.map((q) => ({ unit: q.unit, limit: q.limit, window: q.window, resetAt: q.resetAt })),
-    schedule: contribution.schedule.map((s) => {
-      const [from, to] = s.window.split("-");
-      return { from, to, tz: s.tz };
-    }),
-    upstreamOK: true,
+    id: want.cid,
+    kind: want.kind,
+    kindVersion: want.kindVersion,
+    provider: want.provider,
+    seats: want.seats,
+    seatConcurrency: want.seatConcurrency,
+    models: { allow: want.modelsAllow ?? [], deny: want.modelsDeny ?? [] },
   };
 }
 

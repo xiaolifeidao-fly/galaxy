@@ -29,6 +29,10 @@ export interface HeartbeatResult {
   drain: string[];
   quotaUpdate: Record<string, Metering>;
   serverTime: number;
+  // enabled 是主人在控制台定下的生效配置，搭在心跳上下发。
+  // **可选是有意义的**：字段缺失表示对面是老版本 Hub，节点应当维持现状；
+  // 空数组才表示「一条都别跑」。两者混同会让一次版本不匹配把所有通道停掉。
+  enabled?: EnabledContribution[];
 }
 
 export interface NextResult {
@@ -38,17 +42,36 @@ export interface NextResult {
   cancel: string[];
 }
 
-export interface ContributionDeclaration {
+/**
+ * 上报给 Hub 的一项**本机能力**。
+ *
+ * 注意它不再带座位、额度、模型范围 —— 那些是「共享多少」，由主人在控制台定，
+ * 节点报什么都不作数。这里只回答「这台机器有什么、现在能不能干」。
+ */
+export interface CapabilityReport {
   cid: string;
   kind: string;
   kindVersion: number;
   provider: string;
-  models: { allow: string[]; deny: string[] };
+  available: boolean;
+  unavailableReason?: string;
+}
+
+/**
+ * Hub 下发的**生效配置**：主人开着、且本机报了可用的那些能力，连同座位、
+ * 额度、模型范围和挂机时段。节点按它建通道。
+ */
+export interface EnabledContribution {
+  cid: string;
+  kind: string;
+  kindVersion: number;
+  provider: string;
+  modelsAllow: string[];
+  modelsDeny: string[];
   seats: number;
   seatConcurrency: number;
   quota: Array<{ unit: string; limit: number; window: string; resetAt?: string }>;
   schedule: Array<{ from: string; to: string; tz?: string }>;
-  upstreamOK: boolean;
 }
 
 export class ContractMismatchError extends Error {
@@ -103,8 +126,13 @@ export class HubClient {
     bridgeVersion: string;
     contract: number;
     resources: unknown;
-    contributions: ContributionDeclaration[];
-  }): Promise<{ accepted: string[]; rejected: Array<{ cid: string; reason: string }>; quotaEffective: Record<string, unknown> }> {
+    contributions: CapabilityReport[];
+  }): Promise<{
+    accepted: string[];
+    rejected: Array<{ cid: string; reason: string }>;
+    quotaEffective: Record<string, unknown>;
+    enabled?: EnabledContribution[];
+  }> {
     const response = await fetch(this.url("/agent/v1/hello"), {
       method: "POST", headers: this.headers(), body: JSON.stringify(body),
     });
@@ -127,11 +155,12 @@ export class HubClient {
 
   // next 长轮询。204 表示这一轮没活，立刻再来一轮。
   async next(lanes: HubLane[], waitSeconds: number, signal: AbortSignal): Promise<NextResult | undefined> {
+    // POST 而不是 GET：通道列表在请求体里，而 fetch 规范明令 GET/HEAD 不能带 body
+    // （undici 直接拒 "Request with GET/HEAD method cannot have body."，
+    // duplex: "half" 也救不回来）。领活会占租约、扣并发，本来也不是只读操作。
     const response = await fetch(this.url(`/agent/v1/next?waitSeconds=${waitSeconds}`), {
-      method: "GET", headers: this.headers(), body: JSON.stringify({ lanes }),
-      // GET 带请求体：undici 要求显式声明半双工。
-      duplex: "half", signal,
-    } as RequestInit & { duplex: "half" });
+      method: "POST", headers: this.headers(), body: JSON.stringify({ lanes }), signal,
+    });
     if (response.status === 204) return undefined;
     const payload = await readJSON(response);
     if (!response.ok) throw hubError(response.status, payload);

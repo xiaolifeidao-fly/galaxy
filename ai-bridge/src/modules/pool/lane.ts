@@ -1,6 +1,22 @@
-import type { PoolContribution } from "../../config/schema.js";
 import type { Provider } from "../../business/core/index.js";
-import type { ContributionDeclaration } from "./client.js";
+
+/**
+ * 一条通道的运行期配置。
+ *
+ * 它**不是**本地配置文件里的那个 PoolContribution：共享什么、共享多少现在由主人
+ * 在控制台定，Hub 每次心跳下发一份，节点照着建通道。这里只留 Lane 真正用得上的
+ * 那几项，免得为了造一条通道去凑一个完整的配置对象。
+ */
+export interface LaneConfig {
+  id: string;
+  kind: string;
+  kindVersion: number;
+  /** 放置用的 provider 路由键。节点侧的白名单自校验要拿它比对派下来的单元。 */
+  provider: string;
+  seats: number;
+  seatConcurrency: number;
+  models: { allow: string[]; deny: string[] };
+}
 
 // 一条通道 = 一个贡献在节点侧的运行态。座位、并发、排空、限流都按它算。
 //
@@ -15,8 +31,9 @@ export class Lane {
   private readonly perConsumer = new Map<string, number>();
 
   constructor(
-    readonly config: PoolContribution,
-    readonly declaration: ContributionDeclaration,
+    // config 是可变的：主人在控制台改座位或模型范围时原地换掉，不重建通道 ——
+    // 重建会把 inflight 计数清零，正在跑的请求就成了没人认领的并发。
+    public config: LaneConfig,
     readonly provider: Provider,
   ) {}
 

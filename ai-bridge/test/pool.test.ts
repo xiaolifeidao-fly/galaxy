@@ -46,12 +46,18 @@ test("pool 模式的贡献必须指向配了 baseURL 与 authMode 的 relay prov
   );
 });
 
-test("pool 模式至少要有一条启用的贡献，且 id 不能重复", () => {
-  assert.throws(() => parseConfig(poolConfig({ contributions: [] })), /没有任何启用的贡献/);
-  assert.throws(
-    () => parseConfig(poolConfig({ contributions: [{ ...contribution, enabled: false }] })),
-    /没有任何启用的贡献/,
-  );
+// 「一条启用的贡献都没有」现在是**合法**的。
+//
+// 共享哪几种由主人在 Galaxy 控制台定，节点启动时本来就不知道要跑什么 ——
+// hello 之后 Hub 才把生效配置发下来。在配置解析这一层拦一道，等于逼着主人
+// 先在本机配一遍才允许启动，和「配置界面在控制台」正好相反：进程得先跑起来、
+// 先 hello 上去，主人才可能在控制台看到这台机器有什么能力可开。
+test("pool 模式允许一条贡献都没有：共享什么由控制台定", () => {
+  assert.doesNotThrow(() => parseConfig(poolConfig({ contributions: [] })));
+  assert.doesNotThrow(() => parseConfig(poolConfig({ contributions: [{ ...contribution, enabled: false }] })));
+});
+
+test("pool 贡献 id 不能重复", () => {
   assert.throws(
     () => parseConfig(poolConfig({ contributions: [contribution, { ...contribution }] })),
     /重复/,

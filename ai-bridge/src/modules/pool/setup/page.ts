@@ -1,4 +1,9 @@
-// 配置向导的页面。
+// 配对向导的页面。
+//
+// 它只做配对：拿配对码换令牌，把这台机器绑到主人的账号上。共享哪几种能力、
+// 共享多少、什么时段，全部在 Galaxy 控制台的「贡献授权」里定 —— 主人要能
+// 随时随地调整，不该每次都回到这台机器上跑一遍命令。
+// 这里列出的能力清单是**只读**的，只是让主人确认「这台机器上探得到什么」。
 //
 // 它由本机的临时服务自己吐出来，不是 galaxy 控制台跨源来调 —— 页面与接口同源
 // （都在 http://127.0.0.1:<port>），因此没有 CORS、没有混合内容、不受
@@ -89,37 +94,22 @@ export function setupPage(token: string): string {
   </div>
 
   <div class="card">
-    <h2><span class="step">2</span> 共享哪些能力</h2>
-    <p class="hint">只列出本机探测到、且向导支持的能力。<strong>没勾的，平台看不到</strong>，相关代码也不会加载。</p>
+    <h2><span class="step">2</span> 这台机器上探到了什么</h2>
+    <p class="hint">只是让你确认一眼。<strong>共享哪几种、共享多少，在 Galaxy 控制台的「贡献授权」里选</strong> ——
+       配对成功后那边就会出现这台机器。</p>
     <div id="caps"></div>
   </div>
 
-  <div class="card">
-    <h2><span class="step">3</span> 每天最多共享多少</h2>
-    <p class="hint">用满就停止接单，在跑的请求正常跑完，第二天自动恢复。</p>
-    <div class="tier" id="tiers"></div>
-    <div class="row" style="margin-top:16px">
-      <div>
-        <label for="seats">同时服务几个人</label>
-        <input id="seats" type="text" value="3" />
-      </div>
-      <div>
-        <label for="window">挂机时段（留空 = 全天）</label>
-        <input id="window" type="text" placeholder="23:00-08:00" />
-      </div>
-    </div>
-  </div>
-
   <div style="display:flex; gap:10px; align-items:center">
-    <button id="save">保存并完成</button>
-    <button id="quit" class="ghost">退出</button>
+    <button id="quit" class="ghost">完成，退出</button>
   </div>
-  <div id="saveMsg" class="msg"></div>
 
   <div id="done" class="card done" style="margin-top:16px">
-    <h2>配置好了</h2>
+    <h2>配对好了</h2>
     <p class="hint" id="doneDetail"></p>
-    <p class="hint">回到终端运行 <code>ai-bridge start</code> 就开始接单。这个页面可以关掉了。</p>
+    <p class="hint">接下来两件事：回到终端运行 <code>ai-bridge start</code>；
+       在 Galaxy 控制台的「贡献授权」里把要共享的能力打开、给上额度。
+       两件事没有先后 —— 控制台改完，节点最迟 15 秒就跟上。</p>
   </div>
 </div>
 
@@ -145,80 +135,28 @@ function fmtLimit(unit, value) {
   return String(value);
 }
 
-function tierLabel(tier, kinds) {
-  const parts = kinds.map((kind) =>
-    (tier.quota[kind] || []).map((q) => (UNIT_NAMES[q.unit] || q.unit) + " " + fmtLimit(q.unit, q.limit)).join(" / ")
-  ).filter(Boolean);
-  return tier.name + "（" + parts.join("；") + " 每天）";
-}
-
-async function api(path, body) {
-  const res = await fetch(path, {
-    method: body ? "POST" : "GET",
-    headers: { "x-setup-token": TOKEN, ...(body ? { "content-type": "application/json" } : {}) },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const payload = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(payload.error || ("HTTP " + res.status));
-  return payload;
-}
-
-function show(id, text, ok) {
-  const el = document.getElementById(id);
-  el.textContent = text;
-  el.className = "msg show " + (ok ? "ok" : "bad");
-}
-
-// 档位说明只列出**已勾中**的能力：勾了对话模型却给你念视频渲染的时长，
-// 只会让人以为自己多共享了什么。
-function renderTiers() {
-  if (!state) return;
-  const kinds = [...new Set(pickedCaps().map((c) => c.kind))];
-  const shown = kinds.length > 0 ? kinds : Object.keys(state.tiers[0]?.quota ?? {});
-  const current = document.querySelector("input[name=tier]:checked")?.value ?? "medium";
-  document.getElementById("tiers").innerHTML = state.tiers.map((tier) =>
-    '<label><input type="radio" name="tier" value="' + tier.id + '"' +
-    (tier.id === current ? " checked" : "") + ' />' + tierLabel(tier, shown) + "</label>"
-  ).join("");
-  for (const input of document.querySelectorAll("input[name=tier]")) input.onchange = renderTiers;
-}
-
-function capKey(c) { return c.kind + "|" + (c.upstream || c.provider || ""); }
-
 function renderCaps() {
-  const caps = state.capabilities.filter((c) => c.supported);
+  const caps = state.capabilities;
   if (caps.length === 0) {
     document.getElementById("caps").innerHTML =
       '<p class="hint">没有探测到可共享的能力。对话模型需要本机先用官方 CLI 登录过' +
       '（Claude 跑 <code>claude auth login</code>，Codex 登录一次）；视频渲染需要本机装了 ffmpeg。' +
-      '弄好之后刷新这个页面。</p>';
+      '弄好之后刷新这个页面 —— 也可以先配对，之后随时在控制台开启。</p>';
     return;
   }
   document.getElementById("caps").innerHTML = caps.map((c) => {
     const on = c.available;
-    const picked = state.picked.has(capKey(c));
     const title = (KIND_NAMES[c.kind] || c.kind) + " · " + c.provider +
       (c.upstream ? "（" + c.upstream + "）" : "");
     return '<div class="cap' + (on ? "" : " off") + '">' +
-      '<input type="checkbox" data-key="' + capKey(c) + '"' +
-        (on ? "" : " disabled") + (on && picked ? " checked" : "") + ' />' +
+      '<div style="width:18px;flex:none;text-align:center">' + (on ? "✓" : "—") + '</div>' +
       '<div><div class="name">' + title + '</div>' +
-      '<div class="why">' + (on ? "可用" : "不可用：" + (c.detail || "")) + '</div></div></div>';
+      '<div class="why">' + (on ? "可用，去控制台开启即可共享" : "不可用：" + (c.detail || "")) + '</div></div></div>';
   }).join("");
-  // 勾选变了，档位说明要跟着换 —— 它列的是「你选的这几项各给多少」。
-  for (const box of document.querySelectorAll("#caps input[type=checkbox]")) box.onchange = renderTiers;
-}
-
-function pickedCaps() {
-  if (!state) return [];
-  const keys = new Set([...document.querySelectorAll("#caps input[type=checkbox]:checked")]
-    .map((el) => el.dataset.key));
-  return state.capabilities.filter((c) => keys.has(capKey(c)));
 }
 
 async function refresh() {
   state = await api("/api/state");
-  state.picked = new Set(state.contributions.map((c) => c.kind + "|" + (c.upstream || c.provider || "")));
   document.getElementById("hubURL").value = state.hubURL || "";
   document.getElementById("name").value = state.displayName || "";
   const badge = document.getElementById("pairedBadge");
@@ -227,13 +165,7 @@ async function refresh() {
     badge.textContent = "已配对 " + state.nodeId;
     document.getElementById("code").placeholder = "已经配过了，要换账号才需要重新粘";
   }
-  if (state.contributions.length > 0) {
-    const first = state.contributions[0];
-    document.getElementById("seats").value = String(first.seats ?? 3);
-    document.getElementById("window").value = first.window || "";
-  }
   renderCaps();
-  renderTiers();
 }
 
 document.getElementById("join").onclick = async () => {
@@ -246,32 +178,13 @@ document.getElementById("join").onclick = async () => {
       displayName: document.getElementById("name").value.trim(),
     });
     show("joinMsg", "配对成功：" + result.nodeId, true);
+    document.getElementById("doneDetail").textContent =
+      "这台机器已经绑到你的账号上（" + result.nodeId + "）。连接信息写进了 " + result.configPath +
+      (result.backup ? "，改动前的那份备份在 " + result.backup : "");
+    document.getElementById("done").classList.add("show");
     await refresh();
   } catch (e) {
     show("joinMsg", String(e.message || e), false);
-  } finally {
-    btn.disabled = false;
-  }
-};
-
-document.getElementById("save").onclick = async () => {
-  const btn = document.getElementById("save");
-  btn.disabled = true;
-  try {
-    const result = await api("/api/save", {
-      hubURL: document.getElementById("hubURL").value.trim(),
-      picks: pickedCaps().map((c) => ({ kind: c.kind, upstream: c.upstream, provider: c.provider })),
-      tier: document.querySelector("input[name=tier]:checked").value,
-      seats: Number(document.getElementById("seats").value) || 3,
-      window: document.getElementById("window").value.trim(),
-    });
-    show("saveMsg", "已写入 " + result.configPath, true);
-    document.getElementById("doneDetail").textContent =
-      "共享 " + result.count + " 项能力，配置在 " + result.configPath +
-      (result.backup ? "，改动前的那份备份在 " + result.backup : "");
-    document.getElementById("done").classList.add("show");
-  } catch (e) {
-    show("saveMsg", String(e.message || e), false);
   } finally {
     btn.disabled = false;
   }

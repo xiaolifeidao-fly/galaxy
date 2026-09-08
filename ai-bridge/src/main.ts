@@ -40,7 +40,7 @@ function usage(): never {
   process.stdout.write(`ai-bridge <command> [options]
 
   start   [--config <path>]                         启动（relay 模式监听本机；pool 模式加入共享算力池）
-  pool setup [--config <path>] [--hub <url>] [--port N] [--no-open]
+  pool setup [--config <path>] [--hub <url>] [--port N] [--console <url>] [--no-open]
                                                     在浏览器里配对并勾选要共享的能力（推荐）
   pool pair <code> [--name <显示名>]                 用配对码换取长期节点令牌（只换令牌，不配贡献）
   pool probe                                        列出本机探测到的能力（只列出，不申报）
@@ -111,6 +111,8 @@ async function cmdPool(argv: string[]) {
       configPath: arg("--config", argv),
       hubURL: arg("--hub", argv),
       port: port ? Number(port) : undefined,
+      // 控制台不和 Hub 同源时用它指过去；给了就打印控制台入口并放进 CORS 白名单。
+      consoleURL: arg("--console", argv),
       open: !argv.includes("--no-open"),
     });
     return;

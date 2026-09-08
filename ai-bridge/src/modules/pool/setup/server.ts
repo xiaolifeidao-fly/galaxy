@@ -1,11 +1,12 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile, rename, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { readFile, rename, writeFile } from "node:fs/promises";
+import yaml from "js-yaml";
 import { hostname } from "node:os";
 import type { AddressInfo } from "node:net";
+import type { Server } from "node:http";
 import express, { type NextFunction, type Request, type Response } from "express";
-import yaml from "js-yaml";
 import { log } from "../../../core/logger.js";
 import { defaultConfigPath } from "../../../core/paths.js";
 import { loadConfig } from "../../../config/index.js";
@@ -15,73 +16,41 @@ import { HubClient } from "../client.js";
 import { fingerprint, readNodeIdentity, resolveNodeTokenFile, writeNodeIdentity } from "../token.js";
 import { setupPage } from "./page.js";
 
-// pool setup 的本机配置服务。
+// pool setup：本机的**配对**向导。
 //
-// 为什么界面由这里吐、而不是让 galaxy 控制台跨源来调本机接口：
-// 控制台生产环境是 HTTPS，HTTPS 页面访问 http://127.0.0.1 要同时过混合内容、
-// CORS、以及 Chrome 的 Private Network Access 预检，三个浏览器的策略还不一致。
-// 页面与接口同源就一个问题都没有。
+// 它只干一件事 —— 拿配对码换长期节点令牌，把这台机器绑到主人的账号上。
 //
-// 为什么只在配置期起、配完就退：pool 模式运行时刻意不监听任何端口（P-15），
-// 「攻击面就是主动连了谁」这条不该为了一次性的配置向导而永久让步。
+// 「共享哪几种能力、共享多少、什么时段」**不在这里**：那些是主人在 Galaxy 控制台的
+// 「贡献授权」里定的，Hub 每次心跳下发给节点。理由是主人要能随时随地调整，
+// 而不是每次都得回到这台机器上跑一遍命令。本机只保留两件 Hub 做不了的事：
+// 换令牌（要写本机文件），和探测本机有什么能力（要读本机的订阅登录态）。
+//
+// 界面有两个入口，共用下面这一套接口：
+//   · 本机页面（GET /）—— 与接口同源，没有 CORS、没有混合内容，离线机器也能用，是兜底；
+//   · Galaxy 控制台 —— 跨源直连本机，主人不必在控制台和本机页面之间来回跳。
+//
+// 跨源那条要过 CORS 和 Chrome 的 Private Network Access 预检，所以下面显式回了
+// Allow-Private-Network。还有一条治不了的：控制台生产环境是 HTTPS，而这里是
+// http://127.0.0.1 —— Chrome / Firefox 把回环当可信源放行，Safari 更严。
+// 控制台那边连不上时退回本机页面，两个入口的接口完全一样。
+//
+// 为什么只在配对期起、配完就退：pool 模式运行时刻意不监听任何端口（P-15），
+// 「攻击面就是主动连了谁」这条不该为了一次性的配对向导而永久让步。
 
 const IDLE_SHUTDOWN_MS = 15 * 60 * 1000;
 
-/**
- * 每种能力「少量」档一天给多少。
- *
- * 单位必须落在那个 kind 声明的允许集合里（relay / videofarm 适配器各自声明的
- * Metering.Units），用了集合外的单位，hello 会把整条贡献拒掉。
- *
- * 档位不是三张独立的表，而是同一张表乘一个倍数：三档之间只该差在「给多少」，
- * 分开写迟早写出「适中档给的 output 比全力档还多」这种事。
- */
-const BASE_QUOTA: Record<string, Array<{ unit: string; limit: number }>> = {
-  "llm.chat": [
-    { unit: "llm.input_tokens", limit: 5_000_000 },
-    { unit: "llm.output_tokens", limit: 1_000_000 },
-  ],
-  "video.edit.render": [
-    { unit: "video.output_seconds", limit: 1_800 },
-    { unit: "cpu.seconds", limit: 18_000 },
-  ],
-};
-
-const TIERS = [
-  { id: "light", name: "少量", scale: 1 },
-  { id: "medium", name: "适中", scale: 4 },
-  { id: "full", name: "全力", scale: 20 },
-];
-
-// SUPPORTED 是向导认的能力。
-//
-// delivery.task 不在里面：它必须由主人自己写 exec 命令（配置校验里那条
-// 「agent 回合必须用 exec 指定执行器」），而且 delivery-task-planner 侧的
-// --stdio 入口还没做。放进向导等于让人一键配出一条永远跑不通的贡献 ——
-// 那比不提供更糟：派过去的活会失败，失败要算到这台机器的信誉上。
-const SUPPORTED = new Set(Object.keys(BASE_QUOTA));
-
-function quotaFor(kind: string, tierId: string) {
-  const tier = TIERS.find((t) => t.id === tierId);
-  if (!tier) throw new Error(`没有这个额度档位：${tierId}`);
-  const base = BASE_QUOTA[kind];
-  if (!base) throw new Error(`向导还不支持这种能力：${kind}`);
-  return base.map((entry) => ({ unit: entry.unit, limit: entry.limit * tier.scale, window: "day" as const }));
-}
+// 配置向导的固定端口。随机端口对本机页面无所谓（地址是它自己打印的），但控制台要
+// 跨源过来调就必须**事先**知道打哪儿，只能靠一个约定端口。被占用时直接报错退出，
+// 不悄悄换一个 —— 换了控制台就连到一个不存在的地方，还查不出原因。
+const DEFAULT_SETUP_PORT = 39217;
 
 export interface SetupOptions {
   configPath?: string;
   hubURL?: string;
   port?: number;
   open?: boolean;
-}
-
-interface SavedContribution {
-  kind: string;
-  upstream?: string;
-  provider?: string;
-  seats?: number;
-  window?: string;
+  /** Galaxy 控制台地址。给了才会打印控制台入口，并把它的源加进 CORS 白名单。 */
+  consoleURL?: string;
 }
 
 export async function runSetup(options: SetupOptions = {}): Promise<void> {
@@ -89,21 +58,60 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
   if (!existsSync(configPath)) {
     throw new Error(`还没有配置文件：${configPath}（先运行 ai-bridge init）`);
   }
-  // allowNoContributions：这条命令的目的就是把第一条贡献配出来，
-  // 不放行的话第一次跑会被自己要修的那条错误挡在门外。
-  let cfg = loadConfig(configPath, process.env, { allowNoContributions: true });
+  const cfg = loadConfig(configPath, process.env);
 
   const token = randomBytes(32).toString("hex");
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "256kb" }));
 
+  // 控制台跨源直连本机。放开的只是「跨源脚本能不能读到响应」，下面三道闸一条没减。
+  //
+  // 令牌怎么到控制台手上：pool setup 打印的控制台地址里带着它
+  // （?bridge=<端口>&t=<令牌>），控制台页面从自己的 query 里取出来，放进
+  // x-setup-token 发过来。令牌全程只在这台机器的浏览器里，不经过 Hub。
+  const allowedOrigins = consoleOrigins(cfg, options);
+
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const origin = req.headers.origin;
+    // 同源请求（本机那个页面）不带 Origin，什么都不用加。
+    if (!origin) {
+      next();
+      return;
+    }
+    if (!originAllowed(origin, allowedOrigins)) {
+      // 一个 CORS 头都不回：跨源脚本因此读不到响应体，只知道请求失败了。
+      res.status(403).json({ error: "来源不在白名单里" });
+      return;
+    }
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    // 响应随 Origin 变，不声明会被缓存成第一个来访者的那一份。
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "content-type, x-setup-token");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Max-Age", "600");
+    // 刻意**不**发 Allow-Credentials：鉴权走 x-setup-token 头，不靠 cookie。
+    // 发了等于允许别的源带着凭据过来，白担一个用不上的风险。
+
+    // Chrome 的 Private Network Access：公网页面打私有网段要多一次预检，
+    // 少这一条预检就直接失败，业务请求根本发不出去。
+    if (req.header("access-control-request-private-network") === "true") {
+      res.setHeader("Access-Control-Allow-Private-Network", "true");
+    }
+    if (req.method === "OPTIONS") {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
   // 三道闸，缺一条这就是个「本机任何进程都能改你贡献配置」的接口：
   //   1. 只允许回环地址 —— 服务本来就只 bind 127.0.0.1，这是第二层。
   //   2. Host 头必须是 localhost/127.0.0.1 —— 挡 DNS 重绑定：恶意网站把自己的
   //      域名解析到 127.0.0.1，浏览器就会带着那个 Host 打进来。
-  //   3. 一次性令牌 —— 页面是同源的，别的站点读不到它；没有它的请求一律拒。
-  // 全程不发任何 CORS 头，跨源脚本读不到响应。
+  //      控制台跨源过来时 Host 仍是 127.0.0.1:<端口>（fetch 的目标就是它），
+  //      所以这道闸对控制台是透明的，不用为了跨域把它拆掉。
+  //   3. 一次性令牌 —— 跨源脚本拿不到它，除非用户自己从向导地址进来。
   const guard = (req: Request, res: Response, next: NextFunction) => {
     if (!isLoopback(req.socket.remoteAddress)) {
       res.status(403).json({ error: "只允许本机访问" });
@@ -122,10 +130,12 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
 
   let closing = false;
   let idleTimer: NodeJS.Timeout | undefined;
-  const server = app.listen(options.port ?? 0, "127.0.0.1");
-  await once(server, "listening");
+  const wanted = options.port ?? DEFAULT_SETUP_PORT;
+  const server = app.listen(wanted, "127.0.0.1");
+  await listening(server, wanted);
   const port = (server.address() as AddressInfo).port;
   const url = `http://127.0.0.1:${port}/?t=${token}`;
+  const consoleURL = buildConsoleURL(options.consoleURL ?? process.env.AI_BRIDGE_CONSOLE_URL, port, token);
 
   const finish = () => {
     if (closing) return;
@@ -163,17 +173,9 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
         hubURL: options.hubURL ?? cfg.pool?.hubURL ?? "",
         displayName: hostname(),
         resources: result.resources,
-        capabilities: result.capabilities.map((capability) => ({
-          ...capability,
-          // 向导支持不支持这种能力，由服务端说了算，别让页面自己去猜 kind 列表。
-          supported: SUPPORTED.has(capability.kind),
-        })),
-        tiers: TIERS.map((tier) => ({
-          id: tier.id,
-          name: tier.name,
-          quota: Object.fromEntries(Object.keys(BASE_QUOTA).map((kind) => [kind, quotaFor(kind, tier.id)])),
-        })),
-        contributions: describeContributions(cfg),
+        // 能力清单在这里是**只读**的：给主人一个「这台机器上探得到什么」的确认，
+        // 勾选与额度在控制台。写在这儿的话就又变成两个配置入口了。
+        capabilities: result.capabilities,
         ...(await pairedState(cfg)),
       });
     } catch (e) {
@@ -195,47 +197,11 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
         version: 1, nodeId: paired.nodeId, token: paired.token,
         hubURL, pairedAt: new Date().toISOString(),
       });
+      // 连接信息要落到配置里，否则 ai-bridge start 不知道连哪个 Hub。
+      // 这是本机配置**唯一**还需要写的东西 —— 共享什么、共享多少都在控制台。
+      const written = await writePoolConnection(configPath, hubURL);
       log.info("pool_setup_paired", { nodeId: paired.nodeId, fingerprint: fingerprint(paired.token) });
-      res.json({ nodeId: paired.nodeId, tokenFile: file });
-    } catch (e) {
-      next(e);
-    }
-  });
-
-  app.post("/api/save", guard, async (req, res, next) => {
-    touch();
-    try {
-      const hubURL = requireString(req.body?.hubURL, "平台地址");
-      const picks: Pick[] = Array.isArray(req.body?.picks) ? req.body.picks : [];
-      if (picks.length === 0) throw new Error("至少要勾一项能力");
-      const tier = requireString(req.body?.tier, "额度档位");
-      const seats = requirePositive(req.body?.seats, "同时服务人数");
-      const window = String(req.body?.window ?? "").trim();
-      if (window && !/^\d{1,2}:\d{2}-\d{1,2}:\d{2}$/.test(window)) {
-        throw new Error("挂机时段要写成 23:00-08:00 这种形状");
-      }
-      // 勾选是从浏览器来的，一个字段都不能当真：kind 决定用哪套额度单位，
-      // upstream 会变成「借哪一份凭据」，两个都必须回到本机配置里核一遍。
-      for (const pick of picks) {
-        if (!SUPPORTED.has(pick.kind)) throw new Error(`向导还不支持这种能力：${pick.kind}`);
-        if (pick.kind === "llm.chat") {
-          const name = requireString(pick.upstream, "凭据来源");
-          const provider = cfg.providers[name];
-          if (!provider) throw new Error(`配置里没有 provider "${name}"`);
-          if (provider.type !== "relay" || !provider.baseURL || !provider.authMode) {
-            throw new Error(`provider "${name}" 不是配了 baseURL 与 authMode 的 relay，不能作为中转类贡献`);
-          }
-        } else {
-          requireString(pick.provider, "执行器");
-        }
-        quotaFor(pick.kind, tier);
-      }
-
-      const written = await writeContributions(configPath, { hubURL, picks, tier, seats, window });
-      // 写完立刻按**严格**规则重读一次：宁可在这里报错，也不要让用户
-      // 兴冲冲去跑 start 才发现配置是坏的。
-      cfg = loadConfig(configPath, process.env);
-      res.json({ configPath, count: picks.length, backup: written.backup });
+      res.json({ nodeId: paired.nodeId, tokenFile: file, configPath, backup: written.backup });
     } catch (e) {
       next(e);
     }
@@ -251,8 +217,13 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
   });
 
   process.stdout.write(`配置向导已启动：${url}\n`);
+  if (consoleURL) {
+    process.stdout.write(`也可以在 Galaxy 控制台里配：${consoleURL}\n`);
+  }
   process.stdout.write("它只监听本机、只接受这一个地址里的令牌，配置完成或 15 分钟无操作后自动退出。\n");
-  if (options.open !== false) openBrowser(url);
+  // 只在明确配了控制台地址时才开控制台那个：没配的话默认值是 Hub 的源，
+  // 开发环境下 Hub 和控制台并不同源，开过去是个 404，不如开本机页面。
+  if (options.open !== false) openBrowser(consoleURL ?? url);
 
   await once(server, "close");
   process.stdout.write("配置向导已退出。\n");
@@ -267,43 +238,21 @@ interface Pick {
   provider?: string;
 }
 
-interface WriteInput {
-  hubURL: string;
-  picks: Pick[];
-  tier: string;
-  seats: number;
-  window: string;
-}
-
 /**
- * 把勾选结果写回 config.yaml。
+ * 把配对拿到的连接信息写回 config.yaml：`mode: pool` 和 `pool.hubURL`。
  *
- * **只动 `mode:` 那一行和 `pool:` 那一段，其余每一行原样保留。**
+ * **只动这两处，其余每一行原样保留。** 不走「整个 load 再 dump」那条路：
+ * init 生成的配置里三分之二是注释，把每个字段的用途、风险和默认值都写在旁边，
+ * round-trip 一次全没了（实测 7032 字节缩到 1249）。用户第一次配置就把说明书
+ * 弄丢，不是可接受的代价。
  *
- * 不走「整个 load 再 dump」那条路：`init` 生成的配置里三分之二是注释，
- * 把每个字段的用途、风险和默认值都写在旁边，round-trip 一次全没了
- * （实测 7032 字节缩到 1249）。用户第一次配置就把说明书弄丢，不是可接受的代价。
- *
- * 换 YAML 库能保住注释，但为一次写回引一条依赖不划算；顶层块的边界在 YAML 里
- * 就是「行首非空白」，切起来足够确定。切完立刻按严格规则重读一次做验证。
+ * 顶层块的边界在 YAML 里就是「行首非空白」，切起来足够确定。
  */
-async function writeContributions(configPath: string, input: WriteInput): Promise<{ backup: string }> {
+async function writePoolConnection(configPath: string, hubURL: string): Promise<{ backup: string }> {
   const original = await readFile(configPath, "utf8");
-
-  const contributions = input.picks.map((pick) => ({
-    // id 用 upstream 的配置键或 provider 路由键：两者在各自的命名空间里都唯一，
-    // 而且一眼看得出这条贡献是哪来的。
-    id: pick.upstream ?? pick.provider ?? pick.kind,
-    kind: pick.kind,
-    ...(pick.upstream ? { upstream: pick.upstream } : { provider: pick.provider }),
-    seats: input.seats,
-    quota: quotaFor(pick.kind, input.tier),
-    ...(input.window ? { schedule: [{ window: input.window }] } : {}),
-    enabled: true,
-  }));
-  // 保留 pool 段里除 hubURL / contributions 之外的字段（heartbeatSec、tokenFile 这些）。
   const previous = (yaml.load(original) ?? {}) as Record<string, any>;
-  const pool = { ...(previous.pool ?? {}), hubURL: input.hubURL, contributions };
+  // 保留 pool 段里的其它字段（heartbeatSec、tokenFile、contract 这些）。
+  const pool = { ...(previous.pool ?? {}), hubURL };
 
   let text = replaceTopLevel(original, "mode", "mode: pool\n");
   text = replaceTopLevel(text, "pool", yaml.dump({ pool }, { lineWidth: 100, noRefs: true }));
@@ -342,22 +291,92 @@ export function replaceTopLevel(text: string, key: string, replacement: string):
   return [...lines.slice(0, head), ...body.split("\n"), ...lines.slice(end)].join("\n");
 }
 
-function describeContributions(cfg: AppConfig): SavedContribution[] {
-  return (cfg.pool?.contributions ?? []).map((c) => ({
-    kind: c.kind,
-    upstream: c.upstream,
-    provider: c.provider,
-    seats: c.seats,
-    window: c.schedule[0]?.window,
-  }));
-}
-
 async function pairedState(cfg: AppConfig): Promise<{ paired: boolean; nodeId?: string }> {
   const identity = await readNodeIdentity(resolveNodeTokenFile(cfg.pool));
   return identity ? { paired: true, nodeId: identity.nodeId } : { paired: false };
 }
 
 // ---------- 小工具 ----------
+
+/**
+ * 这个源能不能跨源调本机向导。
+ *
+ * **导出是为了能单测。** 这是整个跨域改动里唯一一条安全判定，埋在闭包里就只能靠
+ * 起一个真服务来验，回归成本高到不会有人补 —— 而它恰恰是最不能悄悄写错的一段。
+ *
+ * 回环源一律放行：能从 127.0.0.1 发起请求的页面本来就跑在这台机器上，而且令牌
+ * 那道闸还在。开发时控制台在 :7898、Hub 在 :10004，是两个不同的源，
+ * 写死任何一个都会在另一种部署下失效。
+ */
+export function originAllowed(origin: string, allowed: ReadonlySet<string>): boolean {
+  if (allowed.has(origin)) return true;
+  try {
+    const { hostname: name } = new URL(origin);
+    return name === "127.0.0.1" || name === "localhost" || name === "::1";
+  } catch {
+    // 解析不了的 Origin 一律不认。浏览器不会发出这种东西，能发的都不是浏览器。
+    return false;
+  }
+}
+
+/**
+ * 允许跨源过来的控制台源。
+ *
+ * 默认只有 Hub 自己那个源 —— 控制台与 Hub 同源部署是最常见的形态。部署方把控制台
+ * 放在别的域名下时，用 --console <地址> 或 AI_BRIDGE_CONSOLE_ORIGINS=<源,源> 补进来。
+ * 回环源不在这里，由 originAllowed 单独放行（开发时端口不固定，枚举不完）。
+ */
+export function consoleOrigins(cfg: AppConfig, options: SetupOptions): Set<string> {
+  const result = new Set<string>();
+  const add = (value: string | undefined) => {
+    const text = value?.trim();
+    if (!text) return;
+    try {
+      result.add(new URL(text).origin);
+    } catch {
+      // 写错的地址直接忽略：为一个填错的白名单项让整个向导起不来不划算。
+    }
+  };
+  add(options.hubURL ?? cfg.pool?.hubURL);
+  add(options.consoleURL ?? process.env.AI_BRIDGE_CONSOLE_URL);
+  for (const item of (process.env.AI_BRIDGE_CONSOLE_ORIGINS ?? "").split(",")) add(item);
+  return result;
+}
+
+/**
+ * 控制台入口地址：把端口和一次性令牌带过去，控制台页面靠它们直连本机。
+ *
+ * 令牌放 query 而不是 fragment：控制台要在服务端渲染前就拿到它做首屏请求，
+ * 而 fragment 根本不会发给服务器。它只在本机浏览器和本机服务之间流转，
+ * 且 15 分钟后连服务本身都没了。
+ */
+function buildConsoleURL(base: string | undefined, port: number, token: string): string | undefined {
+  const text = base?.trim();
+  if (!text) return undefined;
+  try {
+    const target = new URL("/provider/overview", text);
+    target.searchParams.set("bridge", String(port));
+    target.searchParams.set("t", token);
+    return target.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+// listening：起不来必须说清楚是端口被占了。固定端口是为了让控制台找得到，
+// 悄悄换一个只会让控制台连到一个不存在的地方，比直接失败更难查。
+function listening(server: Server, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.once("listening", () => resolve());
+    server.once("error", (error: NodeJS.ErrnoException) => {
+      reject(
+        error.code === "EADDRINUSE"
+          ? new Error(`端口 ${port} 被占用了。换一个：ai-bridge pool setup --port <端口>`)
+          : error,
+      );
+    });
+  });
+}
 
 function isLoopback(address: string | undefined): boolean {
   if (!address) return false;
@@ -383,14 +402,6 @@ function requireString(value: unknown, label: string): string {
   const text = String(value ?? "").trim();
   if (!text) throw new Error(`${label}不能为空`);
   return text;
-}
-
-function requirePositive(value: unknown, label: string): number {
-  const number = Number(value);
-  if (!Number.isFinite(number) || number <= 0 || !Number.isInteger(number)) {
-    throw new Error(`${label}要是一个正整数`);
-  }
-  return number;
 }
 
 function once(emitter: NodeJS.EventEmitter, event: string): Promise<void> {

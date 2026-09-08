@@ -18,17 +18,8 @@ function expandEnv(obj: unknown, env: NodeJS.ProcessEnv): unknown {
   return obj;
 }
 
-export interface ValidateOptions {
-  // allowNoContributions 放行「mode=pool 但一条贡献都没有」。
-  //
-  // 只有 pool setup 该用它：那条命令的**目的**就是把第一条贡献配出来，
-  // 而它得先把配置读进来才知道 hubURL 和有哪些 provider。不放行的话，
-  // 装完插件第一次跑 setup 会被自己要修的那条错误挡在门外。
-  allowNoContributions?: boolean;
-}
-
 // 配置文件之外的一致性校验：引用的 provider 必须存在且类型对得上。
-export function validateConfig(cfg: AppConfig, options: ValidateOptions = {}): AppConfig {
+export function validateConfig(cfg: AppConfig): AppConfig {
   const relayTargets: Array<[string, string | undefined]> = [
     ["relay.anthropic", cfg.relay.anthropic],
     ["relay.openai", cfg.relay.openai],
@@ -81,9 +72,14 @@ export function validateConfig(cfg: AppConfig, options: ValidateOptions = {}): A
         throw new Error(`贡献 "${c.id}" 既没有 upstream 也没有 provider，没有任何东西能执行它`);
       }
     }
-    if (!options.allowNoContributions && cfg.pool.contributions.filter((c) => c.enabled).length === 0) {
-      throw new Error("mode=pool 但没有任何启用的贡献；跑 ai-bridge pool setup 在浏览器里勾选，或用 ai-bridge pool probe 看看本机有什么能力");
-    }
+    // 这里**不再**要求配置里有启用的贡献。
+    //
+    // 共享哪几种由主人在 Galaxy 控制台定，节点启动时本来就不知道要跑什么 ——
+    // hello 之后 Hub 才会把生效配置发下来。在这儿拦一道，等于逼着主人先在本机
+    // 配一遍才允许启动，和「配置界面在控制台」这条正好相反。
+    //
+    // 一条都没开的情况由 runner 打日志提示（pool_nothing_enabled），不阻止启动：
+    // 进程得先跑起来、先 hello 上去，主人才可能在控制台看到这台机器有什么。
   }
   const aliases = new Set<string>();
   for (const t of cfg.auth.tokens) {
@@ -93,29 +89,21 @@ export function validateConfig(cfg: AppConfig, options: ValidateOptions = {}): A
   return cfg;
 }
 
-export function parseConfig(
-  raw: unknown,
-  env: NodeJS.ProcessEnv = process.env,
-  options: ValidateOptions = {},
-): AppConfig {
+export function parseConfig(raw: unknown, env: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = AppConfigSchema.safeParse(expandEnv(raw ?? {}, env));
   if (!parsed.success) {
     throw new Error(`Invalid config: ${JSON.stringify(parsed.error.format(), null, 2)}`);
   }
-  return validateConfig(parsed.data, options);
+  return validateConfig(parsed.data);
 }
 
-export function loadConfig(
-  configPath?: string,
-  env: NodeJS.ProcessEnv = process.env,
-  options: ValidateOptions = {},
-): AppConfig {
+export function loadConfig(configPath?: string, env: NodeJS.ProcessEnv = process.env): AppConfig {
   const file = configPath ?? defaultConfigPath(env);
   if (!fs.existsSync(file)) {
     throw new Error(`Config file not found: ${file}（先运行 ai-bridge init）`);
   }
   const raw = yaml.load(fs.readFileSync(file, "utf8"));
-  return parseConfig(raw, env, options);
+  return parseConfig(raw, env);
 }
 
 export { AppConfigSchema } from "./schema.js";
