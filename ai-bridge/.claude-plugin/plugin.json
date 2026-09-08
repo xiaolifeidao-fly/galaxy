@@ -1,0 +1,9 @@
+{
+  "name": "ai-bridge",
+  "version": "0.1.0",
+  "description": "Local bridge service (Node) for Claude Code / Codex: relays Anthropic Messages and OpenAI Responses through the machine's subscription login, with token auth, scopes and pluggable modules.",
+  "author": {
+    "name": "Universe Team"
+  },
+  "skills": "./skills/"
+}

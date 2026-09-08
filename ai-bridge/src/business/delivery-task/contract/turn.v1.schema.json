@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "galaxy/delivery-task/turn.v1",
+  "title": "delivery.task 回合入参",
+  "type": "object",
+  "required": ["input"],
+  "properties": {
+    "seq": { "description": "回合序号。(sid, seq) 是幂等键，重复提交不重跑。", "type": "integer", "minimum": 1 },
+    "phase": { "description": "任务阶段：requirement / development / testing 等", "type": "string" },
+    "itemKey": { "description": "任务业务键", "type": "string" },
+    "programRef": { "description": "业务侧项目标识", "type": "string" },
+    "space": { "description": "业务自己的空间；共享池不解读，只存下来供回查", "type": "string" },
+    "input": {
+      "type": "object",
+      "properties": {
+        "text": { "type": "string" },
+        "attachments": {
+          "description": "大文件走 OSS 引用，不占内联额度",
+          "type": "array",
+          "items": { "type": "object", "required": ["store", "key"] }
+        }
+      },
+      "additionalProperties": true
+    },
+    "executor": {
+      "type": "object",
+      "properties": {
+        "provider": { "type": "string" },
+        "reasoningEffort": { "type": "string" },
+        "fastMode": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

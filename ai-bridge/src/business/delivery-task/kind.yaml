@@ -1,0 +1,32 @@
+# delivery.task 的能力注册。Hub 侧的等价声明在
+# server/galaxy-api/adapters/delivery 的 Kind()，两侧不一致时 hello 阶段会被拒。
+kind: delivery.task
+version: 1
+primitive: session
+providers: [delivery-task-planner]
+input:
+  schema: contract/turn.v1.schema.json
+  maxInlineBytes: 262144
+metering:
+  units: [llm.input_tokens, llm.output_tokens, llm.calls, time.seconds]
+  # token 由节点自报：回合是 agent 在本机跑出来的，Hub 看不到上游那条流。
+  # 次数与时长仍由 Hub 自己计。
+  trusted: [llm.calls, time.seconds]
+placement:
+  # 硬亲和：会话活着时钉在同一个贡献上，换机器要走显式迁移并交接上下文。
+  affinity: hard
+  requires: {}
+  localityHint: none
+retry:
+  # 回合不幂等：agent 会写文件、跑命令，重跑一次不等于没跑过。
+  idempotent: false
+  maxAttempts: 1
+lease:
+  renewSec: 60
+  maxRunSec: 3600
+retention:
+  inputs: 7d
+  outputs: 30d
+context:
+  schema: contract/context-delta.v1.schema.json
+  resume: ledger+checkpoint

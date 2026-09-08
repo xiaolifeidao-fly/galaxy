@@ -1,0 +1,15 @@
+node_modules/
+dist/
+logs/
+*.log
+*.pid
+*.tar.gz
+package/
+
+# Real runtime config lives outside the repo (~/.config/ai-bridge/config.yaml by default).
+# Only config.example.yaml is versioned.
+/config.yaml
+.env
+.env.*
+!.env.example
+.DS_Store

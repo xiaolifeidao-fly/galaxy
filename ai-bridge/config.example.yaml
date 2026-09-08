@@ -1,0 +1,182 @@
+# ai-bridge 配置。`ai-bridge init` 会把这个文件拷到 ~/.config/ai-bridge/config.yaml。
+# 支持 ${ENV_VAR} 占位符。
+
+server:
+  # 默认只监听本机。要给别的机器用：改成 0.0.0.0，并且务必配 auth.ipAllowlist 或放在防火墙后面。
+  host: 127.0.0.1
+  port: 8787
+  requestTimeoutMs: 1800000      # 30min：整体请求超时（含排队 + 上游）
+  queueWaitTimeoutMs: 120000
+  streamIdleTimeoutMs: 120000    # SSE 相邻 chunk 最大间隔
+  shutdownTimeoutMs: 30000
+  bodyLimit: 30mb
+  trustProxy: false              # 放在 nginx 等反代后面时打开
+
+log:
+  level: info                    # debug | info | warn | error
+
+# 访问控制：三层。
+#   1. ipAllowlist  —— 来源 IP/CIDR 白名单（空 = 不限）
+#   2. tokens       —— 每个调用方一个 token；建议用 `ai-bridge token add` 生成，只存哈希
+#   3. scopes       —— token 能碰哪些模块：relay:anthropic / relay:openai / agent / admin / *
+auth:
+  enabled: true
+  ipAllowlist: []
+  adminLoopbackOnly: true        # /admin/* 只允许 127.0.0.1 访问
+  # tokenFile: ~/.local/state/ai-bridge/tokens.json   # 默认值，一般不用改
+  # 也可以内联；明文 token 请用 `openssl rand -hex 24` 生成，或直接填 sha256（tokenHash）
+  tokens: []
+  #  - token: "${AI_BRIDGE_TOKEN_FLY}"
+  #    alias: fly
+  #    scopes: [relay:anthropic, relay:openai]
+  #    concurrency: 4
+
+# 三层并发闸门：token（见上）→ provider → global
+concurrency:
+  global: 24
+  queueMaxSize: 128
+
+retry:                           # 仅 agent 模块用；relay 不自动重试，把上游 429/5xx 原样交给客户端
+  maxAttempts: 3
+  baseDelayMs: 500
+  maxDelayMs: 8000
+
+# 上游。type=relay 是纯透传；codex_local / claude_code_local 是本机 agent（agent 模块用）。
+providers:
+  # Claude 订阅 HTTP 透传：桥接所在机器先 `claude auth login`。
+  # macOS 默认读 Keychain，其它平台读 ~/.claude/.credentials.json；也可设 CLAUDE_CODE_OAUTH_TOKEN。
+  relay_claude:
+    type: relay
+    authMode: claude_oauth
+    baseURL: "https://api.anthropic.com/v1"
+    # authFile: ~/.claude/.credentials.json
+    concurrency: 2
+    queueMaxSize: 16
+
+  # Codex 订阅透传：桥接所在机器先 `codex login`，读 ~/.codex/auth.json，过期自动刷新。
+  relay_codex:
+    type: relay
+    authMode: codex_chatgpt
+    baseURL: "https://chatgpt.com/backend-api/codex"
+    # authFile: ~/.codex/auth.json
+    concurrency: 6
+    queueMaxSize: 64
+
+  # 转发到任意兼容网关时用 api_key：
+  # relay_gateway:
+  #   type: relay
+  #   authMode: api_key
+  #   apiKey: "${GATEWAY_API_KEY}"
+  #   baseURL: "https://gateway.example.com/v1"
+
+  # 本机 agent（agent 模块，默认关）：
+  # claude_code_local:
+  #   type: claude_code_local
+  #   concurrency: 2
+  #   claudeCode:
+  #     permissionMode: bypassPermissions
+  #     toolsPreset: claude_code
+  # codex_local:
+  #   type: codex_local
+  #   concurrency: 4
+  #   codex:
+  #     sandboxMode: workspace-write
+  #     approvalPolicy: never
+  #     skipGitRepoCheck: true
+  #     defaultReasoningEffort: low
+
+# 中转模块：按协议族选上游。
+#   anthropic → /v1/messages、/v1/messages/count_tokens
+#   openai    → /v1/responses、/v1/chat/completions
+relay:
+  enabled: true
+  anthropic: relay_claude
+  openai: relay_codex
+
+# 本机 agent 模块：请求带 header（值非空）时，同一路径改为在本机跑 agent。
+agent:
+  enabled: false
+  header: x-ai-agent
+  routes: []
+  #  - match: "claude-*"
+  #    provider: claude_code_local
+  #  - match: "*"
+  #    provider: codex_local
+  #    rewriteTo: gpt-5.5
+
+admin:
+  enabled: true
+
+# ---------------------------------------------------------------------------
+# 共享算力池（pool 模式）
+# ---------------------------------------------------------------------------
+# mode: pool 时进程不监听任何端口，也不读 server / auth / relay / admin 这几段：
+# 它只主动出站连 Hub，把你勾选的能力按你定的额度共享出去。
+#
+# 上手顺序：
+#   1. 在控制台阅读并同意条款，生成一次性配对码
+#   2. ai-bridge pool pair <配对码>
+#   3. ai-bridge pool probe          看看本机有什么能力（只列出，不申报）
+#   4. 把想共享的写进下面的 contributions，再 ai-bridge start
+#
+# mode: pool
+# pool:
+#   hubURL: https://hub.example.com
+#   # 节点令牌落盘位置；不填走 ~/.local/state/ai-bridge/node-token.json（权限 0600）
+#   # tokenFile: ~/.ai-bridge/node-token
+#   heartbeatSec: 15
+#   nextWaitSec: 25
+#   contract: 1
+#   contributions:
+#     - id: claude-main
+#       kind: llm.chat
+#       kindVersion: 1
+#       # 引用上面 providers 里的一项；路由键由它的 authMode 推出来
+#       upstream: anthropic
+#       models:
+#         allow: ["claude-sonnet-*"]
+#         deny: ["claude-opus-*"]
+#       # 同时服务几个消费者，以及每个消费者能并行几条请求
+#       seats: 3
+#       seatConcurrency: 2
+#       # 三维额度同时生效，任一触顶就停止接新单，在跑的跑完
+#       quota:
+#         - { unit: llm.output_tokens, limit: 2000000, window: day, resetAt: "00:00+08:00" }
+#         - { unit: time.seconds,      limit: 14400,   window: day, resetAt: "00:00+08:00" }
+#         - { unit: llm.calls,         limit: 800,     window: day, resetAt: "00:00+08:00" }
+#       # 只在这些时段接单，时段外自动排空
+#       schedule:
+#         - { window: "22:00-08:00", tz: Asia/Shanghai }
+#       enabled: true
+#
+#     # 贡献 agent 回合执行能力（任务宇宙）。
+#     # 注意这条和上面那条性质完全不同：它会在你的机器上跑命令、写文件。
+#     # exec 指定的命令由你自己决定，Hub 无权也无法指定跑什么。
+#     # 进程协议：stdin 收一个 JSON，stdout 吐 NDJSON 事件流。
+#     - id: planner
+#       kind: delivery.task
+#       provider: delivery-task-planner
+#       exec:
+#         command: /usr/local/bin/delivery-task-worker
+#         args: ["--stdio"]
+#         cwd: ~/work
+#         timeoutMs: 3600000
+#       seats: 1
+#       seatConcurrency: 1
+#       quota:
+#         - { unit: llm.output_tokens, limit: 1000000, window: day }
+#         - { unit: time.seconds,      limit: 21600,   window: day }
+#         - { unit: llm.calls,         limit: 200,     window: day }
+#
+#     # 贡献本机渲染能力。素材从 OSS 直取、产物直传 OSS，都不经 Hub。
+#     - id: ffmpeg
+#       kind: video.edit.render
+#       provider: ffmpeg-local
+#       # exec 可省，默认用 PATH 里的 ffmpeg；要用自编的（带硬件编码）在这里指定
+#       # exec: { command: /opt/ffmpeg/bin/ffmpeg, args: ["-hwaccel", "videotoolbox"] }
+#       seats: 1
+#       seatConcurrency: 1
+#       quota:
+#         - { unit: video.output_seconds, limit: 7200,  window: day }
+#         - { unit: cpu.seconds,          limit: 28800, window: day }
+#         - { unit: time.seconds,         limit: 43200, window: day }

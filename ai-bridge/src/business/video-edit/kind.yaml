@@ -1,0 +1,32 @@
+# video.edit.render 的能力注册。Hub 侧的等价声明在
+# server/galaxy-api/adapters/videofarm 的 Kind()。
+kind: video.edit.render
+version: 1
+primitive: job
+providers: [ffmpeg-local]
+input:
+  schema: contract/timeline.v1.schema.json
+  # 时间线本身是一份 JSON；素材全走 OSS 引用，节点直取，不经 Hub。
+  maxInlineBytes: 262144
+metering:
+  units: [video.output_seconds, cpu.seconds, storage.bytes, time.seconds]
+  # 输出时长与 CPU 秒只有跑的那台机器知道；时长与存储由 Hub 自己算。
+  trusted: [time.seconds, storage.bytes]
+placement:
+  affinity: none
+  requires: { diskFreeGB: 20, netMbps: 50 }
+  # 数据引力：优先落在已经缓存了输入素材的机器上，省一次 GB 级下载。
+  localityHint: inputs
+retry:
+  # 幂等：输入在 OSS 上，任意节点按 attempt 重跑一遍结果一样。
+  idempotent: true
+  maxAttempts: 2
+lease:
+  renewSec: 60
+  maxRunSec: 7200
+retention:
+  inputs: 24h
+  outputs: 7d
+context:
+  schema: none
+  resume: none

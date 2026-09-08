@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "galaxy",
+  "description": "Galaxy 插件市场：每个插件一个子目录",
+  "owner": {
+    "name": "Universe Team"
+  },
+  "plugins": [
+    {
+      "name": "ai-bridge",
+      "description": "本机 Node 桥接服务：用本机 Claude / Codex 订阅登录态中转 Anthropic Messages 与 OpenAI Responses，带 token 鉴权、scope 与可扩展模块。",
+      "category": "productivity",
+      "source": "./ai-bridge"
+    }
+  ]
+}

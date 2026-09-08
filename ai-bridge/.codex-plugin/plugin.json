@@ -1,0 +1,23 @@
+{
+  "name": "ai-bridge",
+  "version": "0.1.0",
+  "description": "Run a local relay bridge for Claude / Codex subscriptions.",
+  "author": {
+    "name": "Universe Team"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AI Bridge",
+    "shortDescription": "Local relay bridge for Claude Code and Codex.",
+    "longDescription": "Starts a local Node bridge that relays Anthropic Messages and OpenAI Responses requests through this machine's Claude / Codex subscription login. Manages access tokens with scopes, per-token concurrency and IP allowlists. Designed as a module host so more capabilities can be added later.",
+    "developerName": "Universe Team",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "启动 ai-bridge 中转服务",
+      "给同事生成一个中转 token"
+    ]
+  }
+}

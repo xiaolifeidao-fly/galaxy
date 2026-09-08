@@ -1,0 +1,31 @@
+# llm.chat 的能力注册。Hub 侧的等价声明在 server/galaxy-api/adapters/relay 的 Kind()，
+# 两侧不一致时 hello 阶段会被拒（S-11）。
+kind: llm.chat
+version: 1
+primitive: relay
+families: [anthropic, openai]
+providers: [claude_oauth, codex_chatgpt]
+input:
+  schema: contract/input.v1.schema.json
+  maxInlineBytes: 4194304
+metering:
+  units: [llm.input_tokens, llm.output_tokens, llm.cache_read_tokens, llm.cache_write_tokens, llm.calls, time.seconds]
+  # 全部单位由 Hub 从透传的流里自己解析，节点自报只用于对账（S-04）。
+  trusted: [llm.input_tokens, llm.output_tokens, llm.cache_read_tokens, llm.cache_write_tokens, llm.calls, time.seconds]
+placement:
+  affinity: soft
+  requires: {}
+  localityHint: none
+retry:
+  # 幂等只在首字节之前成立：已经流出去的字节收不回来。
+  idempotent: true
+  maxAttempts: 2
+lease:
+  renewSec: 60
+  maxRunSec: 600
+retention:
+  inputs: 0
+  outputs: 0
+context:
+  schema: none
+  resume: none

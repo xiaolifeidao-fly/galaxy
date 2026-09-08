@@ -1,0 +1,434 @@
+import { readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { AppConfig, PoolConfig, PoolContribution } from "../../config/schema.js";
+import { CredentialRegistry } from "../../credentials/index.js";
+import { log } from "../../core/logger.js";
+import {
+  modelMatch,
+  type ArtifactRef, type Metering, type Provider, type UnitEvent, type WorkUnit,
+} from "../../business/core/index.js";
+import { RelayProvider } from "../../business/llm-chat/node/relay-provider.js";
+import { PlannerBridgeProvider } from "../../business/delivery-task/node/planner-bridge.js";
+import { FfmpegLocalProvider } from "../../business/video-edit/node/ffmpeg-local.js";
+import { ContractMismatchError, HubClient, type ContributionDeclaration, type NextResult } from "./client.js";
+import { Lane } from "./lane.js";
+import { localResources } from "./probe.js";
+import { fingerprint, readNodeIdentity, resolveNodeTokenFile } from "./token.js";
+
+// pool 模式的运行循环。
+//
+// 进程不 listen 任何端口（P-15）：主循环是「长轮询领活 → 跑 provider → 上行推流 → 报终态」，
+// 心跳线程每 15s 一次，取消信号搭在这两条已有链路上，不单独轮询（T-05）。
+
+const RECONNECT_MIN_MS = 1_000;
+const RECONNECT_MAX_MS = 30_000;
+
+export interface PoolRunner {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
+  const pool: PoolConfig | undefined = cfg.pool;
+  if (!pool) throw new Error("mode=pool 但缺少 pool 配置段");
+  // 把窄化后的值绑成不可空的局部量：下面几个闭包都要用，逐个加 ! 只会掩盖真问题。
+  const settings: PoolConfig = pool;
+
+  const nodeIdentity = await readNodeIdentity(resolveNodeTokenFile(settings));
+  if (!nodeIdentity) {
+    throw new Error("还没有配对过。先在控制台生成配对码，再运行 ai-bridge pool pair <code>");
+  }
+  const identity = nodeIdentity;
+  const bridgeVersion = await readVersion();
+  const client = new HubClient(settings.hubURL, settings.contract, identity.token, identity.nodeId);
+  const credentials = new CredentialRegistry();
+
+  // 只装载被贡献到的 provider：主人没勾的能力，代码都不加载（X-03）。
+  const lanes = new Map<string, Lane>();
+  for (const contribution of settings.contributions) {
+    if (!contribution.enabled) continue;
+    const routeKey = routeProvider(contribution, cfg);
+    if (!routeKey) continue;
+    const provider = buildProvider(contribution, routeKey, cfg, credentials);
+    lanes.set(contribution.id, new Lane(contribution, declare(contribution, routeKey), provider));
+  }
+  if (lanes.size === 0) throw new Error("没有任何启用的贡献");
+
+  const aborts = new Map<string, AbortController>();
+  let stopping = false;
+  let loopSignal = new AbortController();
+
+  async function sayHello(): Promise<void> {
+    // 贡献里有凭据坏掉的，先探一次，别把一条注定失败的通道申报上去。
+    for (const lane of lanes.values()) {
+      const result = await lane.provider.probe();
+      lane.upstreamOK = result.upstreamOK;
+      lane.declaration.upstreamOK = result.upstreamOK;
+      if (!result.upstreamOK) {
+        log.warn("pool_upstream_unavailable", { cid: lane.cid, detail: result.detail });
+      }
+    }
+    const result = await client.hello({
+      bridgeVersion,
+      contract: settings.contract,
+      resources: localResources(),
+      contributions: [...lanes.values()].map((lane) => lane.declaration),
+    });
+    for (const rejected of result.rejected ?? []) {
+      log.error("pool_contribution_rejected", { cid: rejected.cid, reason: rejected.reason });
+      lanes.delete(rejected.cid);
+    }
+    log.info("pool_hello", {
+      nodeId: identity.nodeId, token: fingerprint(identity.token),
+      accepted: result.accepted, hub: settings.hubURL,
+    });
+  }
+
+  async function heartbeatLoop(): Promise<void> {
+    while (!stopping) {
+      try {
+        const result = await client.heartbeat([...lanes.values()].map((lane) => ({
+          cid: lane.cid,
+          inflight: lane.inflight,
+          queued: 0,
+          throttledUntil: lane.throttledUntil ? lane.throttledUntil.toISOString() : null,
+          upstreamOK: lane.upstreamOK,
+          paused: lane.paused,
+        })));
+        // 取消搭在心跳的响应里：延迟不超过一个上报周期（T-05）。
+        for (const unitId of result.cancel ?? []) {
+          aborts.get(unitId)?.abort(new Error("hub_cancelled"));
+        }
+        const draining = new Set(result.drain ?? []);
+        for (const lane of lanes.values()) {
+          lane.draining = draining.has(lane.cid);
+        }
+      } catch (e) {
+        log.warn("pool_heartbeat_failed", { message: (e as Error)?.message });
+      }
+      await sleep(settings.heartbeatSec * 1000);
+    }
+  }
+
+  async function nextLoop(): Promise<void> {
+    let backoff = RECONNECT_MIN_MS;
+    while (!stopping) {
+      const free = [...lanes.values()]
+        .map((lane) => ({ cid: lane.cid, free: lane.free() }))
+        .filter((entry) => entry.free > 0);
+      if (free.length === 0) {
+        // 所有通道都满了或都在排空：别去长轮询，白占一条连接。
+        await sleep(1_000);
+        continue;
+      }
+      try {
+        const claimed = await client.next(free, settings.nextWaitSec, loopSignal.signal);
+        backoff = RECONNECT_MIN_MS;
+        if (!claimed) continue;
+        for (const unitId of claimed.cancel ?? []) {
+          aborts.get(unitId)?.abort(new Error("hub_cancelled"));
+        }
+        if (!claimed.unit?.id) continue;
+        void dispatch(claimed);
+      } catch (e) {
+        if (stopping) return;
+        log.warn("pool_next_failed", { message: (e as Error)?.message, retryInMs: backoff });
+        await sleep(backoff + Math.floor(Math.random() * 500));
+        backoff = Math.min(RECONNECT_MAX_MS, backoff * 2);
+      }
+    }
+  }
+
+  // dispatch 跑一个工作单元。首字节之前失败可以被 Hub 改派，
+  // 之后失败只能 502 —— 已经流出去的字节收不回来（设计文档 6.2）。
+  async function dispatch(claimed: NextResult): Promise<void> {
+    const unit = claimed.unit;
+    const lane = resolveLane(unit);
+    if (!lane) {
+      await client.complete(unit.id, {
+        lease: claimed.lease.token, state: "failed",
+        error: { class: "node_fault", code: "capability_mismatch", retryable: true, message: "单元不在本机任何贡献的申报范围内" },
+      });
+      return;
+    }
+    if (!lane.acquire(unit.consumerKey)) {
+      await client.complete(unit.id, {
+        lease: claimed.lease.token, state: "failed",
+        error: { class: "node_fault", code: "capability_mismatch", retryable: true, message: "通道已满" },
+      });
+      return;
+    }
+
+    const abort = new AbortController();
+    aborts.set(unit.id, abort);
+    const startedAt = Date.now();
+    // 每个单元一个临时目录，结束后整个删掉：消费者的素材不该在主人机器上留过夜（约束 4）。
+    const workDir = join(tmpdir(), "ai-bridge-unit", unit.id);
+    // 续租心跳：job 可以跑两小时，租约只有 60 秒。不续的话 Hub 会判它跑丢了，
+    // 把同一个任务派给另一台机器重跑一遍 —— 两台机器同时渲染同一条时间线。
+    const renewEvery = Math.max(15_000, (claimed.lease.renewSec || 60) * 500);
+    const renew = setInterval(() => {
+      void client.progress(unit.id, { lease: claimed.lease.token, renew: true })
+        .then((result) => {
+          // 取消搭在续租的响应里回来，不单独轮询（T-05）。
+          if (result.cancelRequested) abort.abort(new Error("hub_cancelled"));
+        })
+        .catch((e) => log.debug("pool_renew_failed", { unitId: unit.id, message: (e as Error)?.message }));
+    }, renewEvery);
+    renew.unref?.();
+    // 终态在下面的生成器闭包里被写。用 UnitOutcome 而不是裸变量：
+    // TS 看不到闭包里的赋值，会把普通变量在后续分支里一路收窄成 never。
+    const outcome = new UnitOutcome();
+
+    try {
+      const iterator = lane.provider.run(unit, {
+        signal: abort.signal,
+        log: (message, meta) => log.debug(message, { unitId: unit.id, cid: lane.cid, ...meta }),
+        workDir,
+        signArtifact: (name, contentType, size) => client.signArtifact(unit.id, { name, contentType, size }),
+        progress: (pct, stage, previewRef) => client.progress(unit.id, {
+          lease: claimed.lease.token, progress: { pct, stage, previewRef }, renew: true,
+        }),
+      })[Symbol.asyncIterator]();
+
+      // 先等到 head：上行连接的状态码与响应头要在建连时就带上。
+      let head: Extract<UnitEvent, { type: "head" }> | undefined;
+      for (;;) {
+        const step = await iterator.next();
+        if (step.done) break;
+        if (step.value.type === "head") { head = step.value; break; }
+        if (step.value.type === "error") { outcome.fail(step.value); break; }
+        if (step.value.type === "done") { outcome.finish(step.value); break; }
+      }
+
+      const earlyFailure = outcome.failure();
+      if (earlyFailure) {
+        await client.complete(unit.id, {
+          lease: claimed.lease.token,
+          state: earlyFailure.code === "unit_cancelled" ? "cancelled" : "failed",
+          error: { class: earlyFailure.class, code: earlyFailure.code, retryable: earlyFailure.retryable, message: earlyFailure.message },
+          ms: Date.now() - startedAt,
+        });
+        return;
+      }
+      if (!head) {
+        await client.complete(unit.id, {
+          lease: claimed.lease.token, state: "completed", usage: outcome.usage(),
+          ...outcome.terminal(), ms: Date.now() - startedAt,
+        });
+        return;
+      }
+
+      // 剩下的事件就是响应字节。边收边推，背压顺着这条连接顶回上游 fetch。
+      async function* chunks(): AsyncIterable<Uint8Array> {
+        for (;;) {
+          const step = await iterator.next();
+          if (step.done) return;
+          const event = step.value;
+          if (event.type === "chunk") { yield event.bytes; continue; }
+          if (event.type === "done") { outcome.finish(event); return; }
+          if (event.type === "error") { outcome.fail(event); return; }
+        }
+      }
+
+      const result = await client.stream(claimed.streamURL, {
+        status: head.status, headers: head.headers, lease: claimed.lease.token,
+        body: chunks(), signal: abort.signal,
+      });
+
+      if (result.consumerGone) {
+        // 410：消费者走了，立刻 abort 上游，不再烧主人的额度。
+        abort.abort(new Error("consumer_gone"));
+        await client.complete(unit.id, { lease: claimed.lease.token, state: "cancelled", usage: outcome.usage(), ms: Date.now() - startedAt });
+        return;
+      }
+      const streamFailure = outcome.failure();
+      if (streamFailure) {
+        await client.complete(unit.id, {
+          lease: claimed.lease.token, state: "failed",
+          error: { class: streamFailure.class, code: streamFailure.code, retryable: streamFailure.retryable, message: streamFailure.message },
+          usage: outcome.usage(), ...outcome.terminal(), ms: Date.now() - startedAt,
+        });
+        return;
+      }
+      await client.complete(unit.id, {
+        lease: claimed.lease.token, state: "completed", usage: outcome.usage(),
+        ...outcome.terminal(), ms: Date.now() - startedAt,
+      });
+    } catch (e) {
+      const cancelled = abort.signal.aborted;
+      await client.complete(unit.id, {
+        lease: claimed.lease.token,
+        state: cancelled ? "cancelled" : "failed",
+        error: cancelled ? null : {
+          class: "node_fault", code: "node_offline", retryable: true,
+          message: (e as Error)?.message ?? "节点执行失败",
+        },
+        ms: Date.now() - startedAt,
+      });
+    } finally {
+      clearInterval(renew);
+      aborts.delete(unit.id);
+      lane.release(unit.consumerKey);
+      // 清场：本机不留消费者内容。删不掉只记日志，不影响这个单元已经报出去的终态。
+      await rm(workDir, { recursive: true, force: true })
+        .catch((e) => log.warn("pool_workdir_cleanup_failed", { unitId: unit.id, message: (e as Error)?.message }));
+      // 日志只记 requestId / cid，不记内容也不记消费者身份。
+      log.info("pool_unit_done", { unitId: unit.id, cid: lane.cid, ms: Date.now() - startedAt });
+    }
+  }
+
+  // resolveLane 是节点侧的白名单自校验（原则 8）。Hub 是路由权威，
+  // 但「在我的机器上执行什么」这条边界不信任 Hub。
+  function resolveLane(unit: WorkUnit): Lane | undefined {
+    for (const lane of lanes.values()) {
+      if (lane.config.kind !== unit.kind || lane.config.kindVersion !== unit.kindVersion) continue;
+      if (lane.declaration.provider !== unit.provider) continue;
+      if (unit.model && !modelMatch(unit.model, lane.config.models.allow, lane.config.models.deny)) continue;
+      return lane;
+    }
+    return undefined;
+  }
+
+  return {
+    async start() {
+      for (;;) {
+        try {
+          await sayHello();
+          break;
+        } catch (e) {
+          if (e instanceof ContractMismatchError) {
+            // 契约不匹配是升级问题，不是网络抖动：立刻停，别把重试打成死循环。
+            log.error("pool_contract_mismatch", { message: e.message });
+            throw e;
+          }
+          log.warn("pool_hello_failed", { message: (e as Error)?.message });
+          await sleep(RECONNECT_MIN_MS);
+        }
+      }
+      void heartbeatLoop();
+      void nextLoop();
+      log.info("pool_started", { nodeId: identity.nodeId, lanes: [...lanes.keys()] });
+    },
+    async stop() {
+      stopping = true;
+      loopSignal.abort(new Error("shutdown"));
+      loopSignal = new AbortController();
+      for (const controller of aborts.values()) controller.abort(new Error("shutdown"));
+      log.info("pool_stopped");
+    },
+  };
+}
+
+// UnitOutcome 收集一次执行的终态。做成对象而不是两个变量，是为了让写入发生在
+// 闭包里、读取发生在主流程里时，类型不被控制流分析误收窄。
+class UnitOutcome {
+  private value: Metering = {};
+  private cause?: Extract<UnitEvent, { type: "error" }>;
+  private done?: Extract<UnitEvent, { type: "done" }>;
+
+  finish(event: Extract<UnitEvent, { type: "done" }>): void {
+    this.value = event.usage ?? {};
+    this.done = event;
+  }
+
+  // terminal 是终态里除用量之外的东西：session 的上下文增量、job 的产物引用。
+  // relay 没有这一层，返回空对象。
+  terminal(): {
+    contextDelta?: unknown;
+    workspaceRef?: unknown;
+    checkpointRef?: unknown;
+    outputs?: Array<{ name: string; ref: ArtifactRef }>;
+  } {
+    if (!this.done) return {};
+    return {
+      contextDelta: this.done.contextDelta,
+      workspaceRef: this.done.workspaceRef,
+      checkpointRef: this.done.checkpointRef,
+      outputs: this.done.outputs,
+    };
+  }
+
+  fail(event: Extract<UnitEvent, { type: "error" }>): void {
+    this.cause = event;
+  }
+
+  usage(): Metering {
+    return this.value;
+  }
+
+  failure(): Extract<UnitEvent, { type: "error" }> | undefined {
+    return this.cause;
+  }
+}
+
+// routeProvider 算出这条贡献的路由键。中转类由 upstream 的 authMode 推出来，
+// 本机执行类在配置里显式写 —— 它没有「上游是谁」这回事。
+function routeProvider(contribution: PoolContribution, cfg: AppConfig): string | undefined {
+  if (contribution.upstream) return cfg.providers[contribution.upstream]?.authMode;
+  return contribution.provider;
+}
+
+function buildProvider(
+  contribution: PoolContribution,
+  routeKey: string,
+  cfg: AppConfig,
+  credentials: CredentialRegistry,
+): Provider {
+  switch (contribution.kind) {
+    case "llm.chat": {
+      if (!contribution.upstream) throw new Error(`贡献 ${contribution.id} 缺少 upstream`);
+      return new RelayProvider({
+        name: routeKey,
+        provider: cfg.providers[contribution.upstream],
+        credentials,
+      });
+    }
+    case "delivery.task": {
+      if (!contribution.exec) throw new Error(`贡献 ${contribution.id} 缺少 exec，无法执行回合`);
+      return new PlannerBridgeProvider({ name: routeKey, exec: contribution.exec });
+    }
+    case "video.edit.render":
+      return new FfmpegLocalProvider({
+        name: routeKey,
+        binary: contribution.exec?.command,
+        extraArgs: contribution.exec?.args,
+      });
+    default:
+      throw new Error(`本节点不支持能力 ${contribution.kind}；升级 ai-bridge 或去掉这条贡献`);
+  }
+}
+
+function declare(contribution: PoolContribution, routeKey: string): ContributionDeclaration {
+  return {
+    cid: contribution.id,
+    kind: contribution.kind,
+    kindVersion: contribution.kindVersion,
+    provider: routeKey,
+    models: { allow: contribution.models.allow, deny: contribution.models.deny },
+    seats: contribution.seats,
+    seatConcurrency: contribution.seatConcurrency,
+    quota: contribution.quota.map((q) => ({ unit: q.unit, limit: q.limit, window: q.window, resetAt: q.resetAt })),
+    schedule: contribution.schedule.map((s) => {
+      const [from, to] = s.window.split("-");
+      return { from, to, tz: s.tz };
+    }),
+    upstreamOK: true,
+  };
+}
+
+async function readVersion(): Promise<string> {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const raw = await readFile(join(here, "..", "..", "..", "package.json"), "utf8");
+    return (JSON.parse(raw) as { version?: string }).version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms).unref?.());
+}

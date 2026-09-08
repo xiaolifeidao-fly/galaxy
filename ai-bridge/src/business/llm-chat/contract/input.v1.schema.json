@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "galaxy/llm-chat/input.v1",
+  "title": "llm.chat 工作单元入参",
+  "description": "relay 原语：请求体原样透传，节点不解析业务字段。这里只约束路由必需的那几项。",
+  "type": "object",
+  "required": ["path", "body"],
+  "properties": {
+    "path": {
+      "description": "上游路径。节点按它决定往哪条协议转发，并再校验一次凭据是否支持。",
+      "type": "string",
+      "enum": ["/v1/messages", "/v1/messages/count_tokens", "/v1/responses", "/v1/chat/completions"]
+    },
+    "body": {
+      "description": "官方 SDK 的请求体原文（base64）。通用层对它不透明。",
+      "type": "string"
+    },
+    "headers": {
+      "description": "转发给上游的客户端头白名单。凭据类头一律不在其中。",
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  },
+  "additionalProperties": true
+}

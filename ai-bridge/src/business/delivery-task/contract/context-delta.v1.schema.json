@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "galaxy/delivery-task/context-delta.v1",
+  "title": "delivery.task 回合上下文增量",
+  "description": "每个回合结束交给服务端账本的结构化增量。节点死了服务端仍拥有完整业务上下文。",
+  "type": "object",
+  "required": ["schema", "seq"],
+  "properties": {
+    "schema": { "const": "delivery-task/context-delta.v1" },
+    "seq": { "type": "integer", "minimum": 1 },
+    "outputSummary": { "description": "这一回合干了什么，人能读懂的一两句", "type": "string" },
+    "toolCalls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "argsDigest": { "description": "参数摘要而不是原文：账本不留业务内容", "type": "string" },
+          "ok": { "type": "boolean" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "changedFiles": { "type": "array", "items": { "type": "string" } },
+    "artifacts": { "type": "array", "items": { "type": "object" } },
+    "externalThreadId": { "description": "节点侧 CLI thread，换节点后失效", "type": "string" },
+    "cliVersion": { "description": "checkpoint 绑这个版本；对不上只能靠账本摘要重建", "type": "string" },
+    "workspaceLost": { "description": "续接时上一个节点未推送的改动已经丢了", "type": "boolean" }
+  },
+  "additionalProperties": true
+}
