@@ -7,7 +7,7 @@
 #
 # --pool 是给「把本机算力共享出去」的人用的，和上面三个是两条路：
 # 它不登记 Claude/Codex 插件，也不启动 relay —— 那会在本机开一个 8787 端口，
-# 而贡献者要的是 pool 模式（不监听任何端口，只有出站连接）。
+# 而贡献者要的是 pool 模式：除了一个本机配置接口（回环 39217），全是出站连接。
 set -euo pipefail
 plugin_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 galaxy_root="$(cd "$plugin_root/.." && pwd)"

@@ -37,8 +37,14 @@ import { fingerprint, readNodeIdentity, resolveNodeTokenFile, writeNodeIdentity 
 // Allow-Private-Network。控制台生产环境是 HTTPS 而这里是 http://127.0.0.1，
 // Chrome / Firefox 把回环当可信源放行，Safari 更严 —— 那条治不了。
 //
-// 为什么只在配对期起、配完就退：pool 模式运行时刻意不监听任何端口（P-15），
-// 「攻击面就是主动连了谁」这条不该为了一次性的配对向导而永久让步。
+// 这个接口有两种生命周期，见 startSetupServer 的说明：
+//   · 临时（pool setup）—— 机器还没配对，常驻进程起不来，配完就退；
+//   · 常驻（ai-bridge start）—— 已配对的机器一直挂着，这样主人随时能从控制台
+//     重新配对，而不必在令牌失效时回终端跑命令。
+//
+// 常驻这一档是对 P-15「一个端口都不开」的**有意让步**：pool 模式除此之外仍然
+// 只有出站连接。让步的代价由三条兜住 —— 只绑回环、配对码鉴权（Hub 只发给已登录
+// 机主、一次性）、以及 Hub 地址在启动时锁死，配对不到别处去。
 
 const IDLE_SHUTDOWN_MS = 15 * 60 * 1000;
 

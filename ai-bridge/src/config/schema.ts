@@ -119,7 +119,8 @@ export const AdminConfigSchema = z.object({
 });
 
 // ---------- 共享算力池（pool 模式） ----------
-// pool 模式下节点不监听任何端口，只主动出站连 Hub（P-15）：攻击面只剩「主动连了谁」。
+// pool 模式下节点只主动出站连 Hub（P-15）：攻击面基本只剩「主动连了谁」。
+// 唯一的例外是本机配置接口（回环 39217），给控制台重新配对用 —— 见 setup/server.ts。
 
 export const PoolQuotaSchema = z.object({
   // 计量单位，如 llm.output_tokens / time.seconds / llm.calls

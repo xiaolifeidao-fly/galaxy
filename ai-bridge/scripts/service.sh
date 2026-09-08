@@ -22,8 +22,8 @@ if [[ -z "$node_bin" ]]; then
 fi
 
 # 运行模式决定健康检查怎么做，所以这里必须知道它。
-# pool 模式刻意不监听任何端口（P-15），拿 /healthz 去探它永远是失败 ——
-# 旧版就是这么写的，于是「装好了」和「装挂了」看起来一模一样。
+# pool 模式没有 /healthz：它只开一个本机配置接口（39217），不跑 relay 那套 HTTP 服务。
+# 旧版拿 /healthz 去探它，永远失败，于是「装好了」和「装挂了」看起来一模一样。
 config_path="$(node "$plugin_root/dist/main.js" config path 2>/dev/null || echo "")"
 mode="relay"
 if [[ -n "$config_path" && -f "$config_path" ]] && grep -qE '^mode:[[:space:]]*pool' "$config_path"; then
@@ -101,7 +101,7 @@ health_check() {
     echo "ai-bridge 在运行，但契约版本和 Hub 对不上，需要升级插件。看日志：$log_file" >&2
     return 1
   fi
-  echo "ai-bridge 正在运行（pool 模式，pid $second，不监听任何端口）"
+  echo "ai-bridge 正在运行（pool 模式，pid $second，本机配置接口 127.0.0.1:39217）"
   return 0
 }
 

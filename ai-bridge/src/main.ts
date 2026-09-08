@@ -80,7 +80,12 @@ async function cmdStart(argv: string[]) {
   process.on("uncaughtException", (err) => log.error("uncaught_exception", { message: err.message, stack: err.stack }));
 }
 
-// pool 模式不监听任何端口：进程只有出站连接，攻击面就是「主动连了谁」（P-15）。
+// pool 模式的对外面只有**一个回环端口**：本机配置接口（39217），给控制台重新配对用。
+// 其余全是出站连接，攻击面就是「主动连了谁」（P-15 的原意）。
+//
+// 这条曾经是「一个端口都不开」。放开一个是为了让主人能随时从控制台重新配对 ——
+// 令牌被撤销/失效时 hello 会一直失败，而那正是最需要重新配对的时刻，
+// 要求他回终端跑命令等于把人堵在门外。代价用配对码鉴权 + hub 锁定 + 限流兜住。
 async function startPool(cfg: Awaited<ReturnType<typeof loadConfig>>, configPath?: string) {
   const runner = await createPoolRunner(cfg);
 
