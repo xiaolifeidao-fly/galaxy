@@ -382,7 +382,7 @@ export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
           if (/令牌无效|未授权|已撤销|revoked|unauthorized/i.test(message) && attempt === 1) {
             log.error("pool_node_token_rejected", {
               message,
-              hint: "这台机器的节点令牌 Hub 不认了。在 Galaxy 控制台重新配对：ai-bridge pool setup",
+              hint: "这台机器的节点令牌 Hub 不认了。打开 Galaxy 控制台「加入共享池」，生成配对码重新配对即可，不用回到这台机器。",
             });
           } else {
             log.warn("pool_hello_failed", { message, attempt });

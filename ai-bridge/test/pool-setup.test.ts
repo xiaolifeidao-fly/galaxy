@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildConsoleURL, originOf, replaceTopLevel } from "../src/modules/pool/setup/server.js";
+import { buildConsoleURL, originOf, replaceTopLevel, startSetupServer } from "../src/modules/pool/setup/server.js";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // replaceTopLevel 是 pool setup 唯一会**改用户文件**的地方。
 // 整个 load 再 dump 会把 init 生成的那几十行注释全洗掉（7032 字节缩到 1249），
@@ -141,4 +144,91 @@ test("解析不了的地址得到空串，且空串不等于任何已锁定的�
   assert.equal(originOf("这不是个地址"), "");
   // 空串参与比对时必须判不通过，否则传个垃圾地址就绕过了锁定
   assert.notEqual(originOf("垃圾"), originOf("https://hub.example.com"));
+});
+
+// ---------- 常驻 / 临时 两档鉴权 ----------
+//
+// 这两档的差别是整个设计的核心，写错任何一边都是安全问题：
+//   · 常驻（已配对、Hub 已锁定）无令牌 —— 靠配对码。写成要令牌，就退回「只有装插件
+//     那一次能配」，用户得回终端跑命令。
+//   · 常驻**不能**挂 /api/state —— 那是机器指纹（机器名、能力清单、配置路径），
+//     常驻接口没有令牌闸，挂上去等于对任何网站公开。
+// 这两条都只在 HTTP 行为上体现，纯函数测不到，所以这里起真服务。
+
+function poolFixture() {
+  const dir = mkdtempSync(join(tmpdir(), "aib-setup-"));
+  const configPath = join(dir, "config.yaml");
+  writeFileSync(
+    configPath,
+    ["mode: pool", "providers: {}", "relay:", "  enabled: false", "pool:",
+     "  hubURL: http://127.0.0.1:59999", `  tokenFile: ${join(dir, "node-token.json")}`, ""].join("\n"),
+    "utf8",
+  );
+  return configPath;
+}
+
+test("常驻模式：ping 不要令牌，且只回布尔值", async () => {
+  const handle = await startSetupServer({ configPath: poolFixture(), port: 0, resident: true });
+  try {
+    const response = await fetch(`http://127.0.0.1:${handle.port}/api/ping`);
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as Record<string, unknown>;
+    assert.equal(body.running, true);
+    assert.equal(body.resident, true);
+    assert.equal(body.paired, false);
+    // 机器指纹一个都不能出现在这个不鉴权的端点上
+    for (const leak of ["displayName", "capabilities", "configPath", "resources", "hubURL"]) {
+      assert.equal(body[leak], undefined, `ping 不该吐 ${leak}`);
+    }
+    assert.equal(handle.token, undefined, "常驻模式不该发令牌");
+  } finally {
+    handle.close();
+    await handle.closed;
+  }
+});
+
+test("常驻模式：/api/state 不挂载（它是机器指纹，没有令牌闸就不能开）", async () => {
+  const handle = await startSetupServer({ configPath: poolFixture(), port: 0, resident: true });
+  try {
+    const response = await fetch(`http://127.0.0.1:${handle.port}/api/state`);
+    assert.equal(response.status, 404);
+  } finally {
+    handle.close();
+    await handle.closed;
+  }
+});
+
+test("常驻模式：/api/join 不因缺令牌而 401 —— 配对码才是凭据", async () => {
+  const handle = await startSetupServer({ configPath: poolFixture(), port: 0, resident: true });
+  try {
+    const response = await fetch(`http://127.0.0.1:${handle.port}/api/join`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: "XXXX-YYYY" }),
+    });
+    // Hub 是个不存在的地址，所以会失败 —— 但**不能**是 401。
+    // 401 说明令牌闸被误开在了常驻档上，用户就又得回终端了。
+    assert.notEqual(response.status, 401, "常驻模式不该要求令牌");
+    assert.equal(response.status, 400);
+  } finally {
+    handle.close();
+    await handle.closed;
+  }
+});
+
+test("临时模式：发令牌，且 /api/join 缺令牌就是 401", async () => {
+  const handle = await startSetupServer({ configPath: poolFixture(), port: 0, resident: false });
+  try {
+    assert.ok(handle.token && handle.token.length === 64, "临时模式必须发 32 字节令牌");
+    const response = await fetch(`http://127.0.0.1:${handle.port}/api/join`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: "XXXX-YYYY" }),
+    });
+    // 新机器没有锁定的 Hub，这一档必须靠令牌闸挡住恶意站点把机器配对到别处
+    assert.equal(response.status, 401);
+  } finally {
+    handle.close();
+    await handle.closed;
+  }
 });

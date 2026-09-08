@@ -14,7 +14,7 @@ import { createPoolRunner } from "./modules/pool/runner.js";
 import { probe as probeCapabilities } from "./modules/pool/probe.js";
 import { HubClient } from "./modules/pool/client.js";
 import { fingerprint, readNodeIdentity, resolveNodeTokenFile, writeNodeIdentity } from "./modules/pool/token.js";
-import { runSetup } from "./modules/pool/setup/server.js";
+import { runSetup, startSetupServer } from "./modules/pool/setup/server.js";
 
 // 命令行入口。子命令：
 //   start            按配置启动：mode=relay 起本机桥接，mode=pool 加入共享算力池
@@ -60,7 +60,7 @@ function usage(): never {
 
 async function cmdStart(argv: string[]) {
   const cfg = loadConfig(arg("--config", argv));
-  if (cfg.mode === "pool") return startPool(cfg);
+  if (cfg.mode === "pool") return startPool(cfg, arg("--config", argv));
 
   const bridge = await createBridge({ cfg });
   await bridge.listen();
@@ -81,8 +81,31 @@ async function cmdStart(argv: string[]) {
 }
 
 // pool 模式不监听任何端口：进程只有出站连接，攻击面就是「主动连了谁」（P-15）。
-async function startPool(cfg: Awaited<ReturnType<typeof loadConfig>>) {
+async function startPool(cfg: Awaited<ReturnType<typeof loadConfig>>, configPath?: string) {
   const runner = await createPoolRunner(cfg);
+
+  // 配置接口挂在常驻进程里 —— 这就是「随时打开控制台就能重新配对」的前提。
+  // 无令牌，鉴权靠配对码；Hub 已锁定（能常驻就说明配对过），最坏结果只是
+  // 在主人自己账号下多一个节点。
+  //
+  // 起不来**不算致命**：端口被占（比如手动跑着一个 pool setup）只该少一个便利功能，
+  // 不该让这台机器停止贡献 —— 贡献才是这个进程存在的理由。
+  let setup: Awaited<ReturnType<typeof startSetupServer>> | undefined;
+  try {
+    setup = await startSetupServer({
+      configPath,
+      resident: true,
+      onPaired: () => {
+        // 进程手里攥着的是**旧**节点身份，重新配对之后那份已经作废。
+        // 退出让 supervisor 用新令牌把它拉起来，比运行中热替换身份可靠得多。
+        log.info("pool_repaired_restarting", {});
+        setTimeout(() => process.exit(0), 500);
+      },
+    });
+    log.info("pool_setup_api_ready", { port: setup.port, pinnedHub: setup.pinnedHub });
+  } catch (e) {
+    log.warn("pool_setup_api_unavailable", { message: (e as Error)?.message });
+  }
 
   // 信号与异常处理必须**先于** runner.start()。start() 要等 hello 成功才返回，
   // 而连不上 Hub（令牌过期、Hub 在维护）时它会在重试循环里待很久 —— 装在后面的话，
@@ -90,6 +113,7 @@ async function startPool(cfg: Awaited<ReturnType<typeof loadConfig>>) {
   // 任何 stray rejection 也没人记，进程会静悄悄地消失。
   const shutdown = async (sig: string) => {
     log.info("signal", { signal: sig });
+    setup?.close();
     await runner.stop();
     process.exit(0);
   };

@@ -57,40 +57,71 @@ export interface SetupOptions {
   hubURL?: string;
   port?: number;
   open?: boolean;
-  /** Galaxy 控制台地址。给了才会打印控制台入口，并把它的源加进 CORS 白名单。 */
+  /** Galaxy 控制台地址。给了才会打印控制台入口。 */
   consoleURL?: string;
+  /** 常驻模式：挂在 ai-bridge start 里，无令牌、无空闲超时，鉴权靠配对码。 */
+  resident?: boolean;
+  /** 常驻模式下重新配对成功后的回调。用来让进程退出、由 supervisor 换新身份拉起。 */
+  onPaired?: () => void;
 }
 
-export async function runSetup(options: SetupOptions = {}): Promise<void> {
+/** 常驻模式下 /api/join 的限流窗口：它没有令牌闸，只有配对码。 */
+const PAIR_WINDOW_MS = 60_000;
+const PAIR_MAX_PER_WINDOW = 10;
+
+export interface SetupHandle {
+  port: number;
+  /** 只有临时模式才有。常驻模式不发令牌，鉴权靠配对码。 */
+  token?: string;
+  consoleURL?: string;
+  pinnedHub: string;
+  close: () => void;
+  closed: Promise<void>;
+}
+
+/**
+ * 起配置接口。两种形态共用同一套代码，区别只有鉴权和生命周期：
+ *
+ * - **临时**（`ai-bridge pool setup`）：机器还没配对过，常驻进程根本起不来
+ *   （createPoolRunner 没有节点令牌会直接抛）。这一档**必须**有 URL 令牌闸 ——
+ *   新机器没有锁定的 Hub，恶意站点若能调 /api/join 就能把这台机器配对到它自己的
+ *   Hub，之后拿主人的订阅额度干活。而这一档的令牌就打印在刚跑完的那条命令下面，
+ *   用户拿得到，代价很小。
+ *
+ * - **常驻**（`ai-bridge start` 的 pool 模式）：机器已经配对，Hub 已经锁死。
+ *   这一档**不要**令牌 —— 要令牌就意味着每次改配置都得回终端跑一遍命令，
+ *   而那正是要解决的问题。鉴权交给配对码：它由 Hub 只签发给已登录的机主、
+ *   一次性、10 分钟有效，而且这里会拿它去**已锁定的那个 Hub** 真兑换一次，
+ *   兑得动就证明调用方拥有这个账号。最坏情况（配对码泄漏）也只是在主人自己
+ *   账号下多出一个节点，劫不走。
+ */
+export async function startSetupServer(options: SetupOptions = {}): Promise<SetupHandle> {
+  const resident = options.resident === true;
   const configPath = options.configPath ?? defaultConfigPath();
   if (!existsSync(configPath)) {
     throw new Error(`还没有配置文件：${configPath}（先运行 ai-bridge init）`);
   }
   const cfg = loadConfig(configPath, process.env);
 
-  const token = randomBytes(32).toString("hex");
+  // 常驻模式不发令牌：那一档靠配对码鉴权，见上面的说明。
+  const token = resident ? "" : randomBytes(32).toString("hex");
 
   // 允许配对到哪个 Hub，**在启动时就定死**，不接受请求体里现编的地址。
   //
-  // 挡的是这条：令牌一旦泄漏（截图、地址栏、服务器日志），拿到它的人可以调
-  // /api/join 传自己的 hubURL —— 他自己的 Hub 当然认任何配对码 —— 于是这台机器的
-  // node-token 和 config 被改写，下次启动就去给他干活，用的是主人的订阅额度。
-  // 装了 LaunchAgent 之后那个「下次启动」还是开机自动发生的。
+  // 挡的是这条：调用方可以调 /api/join 传自己的 hubURL —— 他自己的 Hub 当然认
+  // 任何配对码 —— 于是这台机器的 node-token 和 config 被改写，下次启动就去给他
+  // 干活，用的是主人的订阅额度。装了 LaunchAgent 之后那个「下次启动」还是开机自动的。
   //
   // 首次配对的机器没有可锁的值（init 的模板里没有 pool 段），那时锁不了也不该锁死：
-  // 还没配上任何东西的机器没有可偷的。所以有就锁，没有就在启动时说清楚。
+  // 还没配上任何东西的机器没有可偷的 —— 那一档改由令牌闸兜着。
   const pinnedHub = originOf(options.hubURL ?? cfg.pool?.hubURL);
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "256kb" }));
 
-  // 跨源对所有来源开放。控制台可能被部署在任何域名下，枚举不完；鉴权交给令牌。
-  //
-  // 令牌怎么到控制台手上：pool setup 打印的控制台地址里带着它
-  // （?bridge=<端口>&t=<令牌>），控制台页面从自己的 query 里取出来，放进
-  // x-setup-token 发过来。令牌不经过 Hub，只在这台机器的浏览器里。
+  // 跨源对所有来源开放：控制台可能被部署在任何域名下，枚举不完。
   app.use((req: Request, res: Response, next: NextFunction) => {
-    // 通配符和 Allow-Credentials 互斥，但这里本来就不用 cookie，鉴权走头。
+    // 通配符和 Allow-Credentials 互斥，但这里本来就不用 cookie，鉴权走头/请求体。
     // 也因此不需要 Vary: Origin —— 响应不随来源变化。
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "content-type, x-setup-token");
@@ -109,14 +140,13 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
     next();
   });
 
-  // 三道闸，缺一条这就是个「本机任何进程都能改你贡献配置」的接口：
+  // 本机闸，两种形态都有：
   //   1. 只允许回环地址 —— 服务本来就只 bind 127.0.0.1，这是第二层。
   //   2. Host 头必须是 localhost/127.0.0.1 —— 挡 DNS 重绑定：恶意网站把自己的
   //      域名解析到 127.0.0.1，浏览器就会带着那个 Host 打进来。
   //      控制台跨源过来时 Host 仍是 127.0.0.1:<端口>（fetch 的目标就是它），
-  //      所以这道闸对控制台是透明的，不用为了跨域把它拆掉。
-  //   3. 一次性令牌 —— 跨源脚本拿不到它，除非用户自己从向导地址进来。
-  const guard = (req: Request, res: Response, next: NextFunction) => {
+  //      所以这道闸对控制台是透明的。
+  const localOnly = (req: Request, res: Response, next: NextFunction) => {
     if (!isLoopback(req.socket.remoteAddress)) {
       res.status(403).json({ error: "只允许本机访问" });
       return;
@@ -125,8 +155,31 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
       res.status(403).json({ error: "Host 头不是本机地址" });
       return;
     }
-    if (!tokenMatches(token, req.header("x-setup-token"))) {
+    next();
+  };
+
+  // 临时模式的令牌闸。常驻模式没有令牌，这一层直接放行。
+  const guard = (req: Request, res: Response, next: NextFunction) => {
+    if (!resident && !tokenMatches(token, req.header("x-setup-token"))) {
       res.status(401).json({ error: "令牌不对。请从命令打开的那个地址进入，不要手工敲网址。" });
+      return;
+    }
+    next();
+  };
+
+  // 配对码爆破没戏（40 位、一次性、10 分钟），但每次尝试都会让本机去打一次 Hub。
+  // 不限流就等于把这台机器变成打 Hub 的放大器。
+  let windowStart = 0;
+  let windowCount = 0;
+  const rateLimit = (_req: Request, res: Response, next: NextFunction) => {
+    const now = Date.now();
+    if (now - windowStart > PAIR_WINDOW_MS) {
+      windowStart = now;
+      windowCount = 0;
+    }
+    windowCount += 1;
+    if (windowCount > PAIR_MAX_PER_WINDOW) {
+      res.status(429).json({ error: "配对尝试过于频繁，稍后再试" });
       return;
     }
     next();
@@ -139,14 +192,13 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
   const server = app.listen(wanted, "127.0.0.1");
   await listening(server, wanted);
   const port = (server.address() as AddressInfo).port;
-  const endpoint = `http://127.0.0.1:${port}`;
-  // 控制台地址的三个来源，由近及远：命令行 → 环境变量 → 配置里的 Hub 源
-  // （控制台与 Hub 同源部署是最常见的形态，装完就能直接用）。
-  const consoleURL = buildConsoleURL(
-    options.consoleURL ?? process.env.AI_BRIDGE_CONSOLE_URL ?? options.hubURL ?? cfg.pool?.hubURL,
-    port,
-    token,
-  );
+  const consoleURL = resident
+    ? undefined
+    : buildConsoleURL(
+        options.consoleURL ?? process.env.AI_BRIDGE_CONSOLE_URL ?? options.hubURL ?? cfg.pool?.hubURL,
+        port,
+        token,
+      );
 
   const finish = () => {
     if (closing) return;
@@ -155,7 +207,9 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
     // 先把响应发完再关：立刻 close 会让浏览器看到一个连接被掐断的错误。
     setTimeout(() => server.close(), 200);
   };
+  // 常驻模式没有空闲超时 —— 它就是要一直在，这才是「随时能从控制台配」的前提。
   const touch = () => {
+    if (resident) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       log.warn("pool_setup_idle_timeout", { seconds: Math.round(idleMs / 1000) });
@@ -164,35 +218,51 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
   };
   touch();
 
-  // 界面搬走之后这里不再吐 HTML。留一句话是因为老流程打印过带 /?t= 的地址，
-  // 书签和终端历史里还有 —— 直接 404 会让人以为装坏了。
   app.get("/", (_req, res) => {
     res.type("text").send("ai-bridge 配置接口。界面在 Galaxy 控制台的「加入共享池」里。");
   });
 
-  app.get("/api/state", guard, async (_req, res, next) => {
-    touch();
-    try {
-      const result = await probe(cfg);
-      res.json({
-        configPath,
-        hubURL: options.hubURL ?? cfg.pool?.hubURL ?? "",
-        displayName: hostname(),
-        resources: result.resources,
-        // 能力清单在这里是**只读**的：给主人一个「这台机器上探得到什么」的确认，
-        // 勾选与额度在控制台。写在这儿的话就又变成两个配置入口了。
-        capabilities: result.capabilities,
-        ...(await pairedState(cfg)),
-      });
-    } catch (e) {
-      next(e);
-    }
+  // ping 不鉴权，也**只**回这两个布尔值。控制台靠它判断「本机有没有 ai-bridge 在跑、
+  // 要不要显示配对表单」—— 没有这个探针，控制台就只能靠 URL 参数被动触发，
+  // 也就回到了「只有装插件那一次能配」的老问题。
+  // 代价是任何网站都能探出你装了 ai-bridge。这是为可用性付的、有界的代价：
+  // 它不吐机器名、不吐能力清单、不吐配置路径，那些都在鉴权后面。
+  app.get("/api/ping", localOnly, async (_req, res) => {
+    res.json({ running: true, resident, ...(await pairedState(cfg)) });
   });
 
-  app.post("/api/join", guard, async (req, res, next) => {
+  // 能力清单和配置路径是机器指纹，只在临时模式（有令牌）下给。
+  // 常驻模式不挂它：配对之后控制台从 Hub 拿 available / unavailableReason 就够了，
+  // 再开一个本机口子只是白添攻击面。
+  if (!resident) {
+    app.get("/api/state", localOnly, guard, async (_req, res, next) => {
+      touch();
+      try {
+        const result = await probe(cfg);
+        res.json({
+          configPath,
+          hubURL: options.hubURL ?? cfg.pool?.hubURL ?? "",
+          displayName: hostname(),
+          resources: result.resources,
+          capabilities: result.capabilities,
+          ...(await pairedState(cfg)),
+        });
+      } catch (e) {
+        next(e);
+      }
+    });
+
+    app.post("/api/finish", localOnly, guard, (_req, res) => {
+      res.json({ ok: true });
+      finish();
+    });
+  }
+
+  app.post("/api/join", localOnly, rateLimit, guard, async (req, res, next) => {
     touch();
     try {
-      const hubURL = requireString(req.body?.hubURL, "平台地址");
+      // 常驻模式下 Hub 一定是锁定的（能常驻就说明配对过），请求体里的地址只做校验。
+      const hubURL = pinnedHub && resident ? pinnedHub : requireString(req.body?.hubURL, "平台地址");
       if (pinnedHub && originOf(hubURL) !== pinnedHub) {
         throw new Error(
           `这台机器只能配对到 ${pinnedHub}。要换一个 Hub，请在本机重跑：ai-bridge pool setup --hub <新地址>`,
@@ -208,48 +278,59 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
         version: 1, nodeId: paired.nodeId, token: paired.token,
         hubURL, pairedAt: new Date().toISOString(),
       });
-      // 连接信息要落到配置里，否则 ai-bridge start 不知道连哪个 Hub。
-      // 这是本机配置**唯一**还需要写的东西 —— 共享什么、共享多少都在控制台。
       const written = await writePoolConnection(configPath, hubURL);
-      log.info("pool_setup_paired", { nodeId: paired.nodeId, fingerprint: fingerprint(paired.token) });
-      // 配完就收尾。剩下的只有「让主人看一眼探到了什么」，30 秒够了。
-      idleMs = POST_PAIR_GRACE_MS;
-      touch();
+      log.info("pool_setup_paired", { nodeId: paired.nodeId, fingerprint: fingerprint(paired.token), resident });
+      if (!resident) {
+        // 配完就收尾。剩下的只有「让主人看一眼探到了什么」，30 秒够了。
+        idleMs = POST_PAIR_GRACE_MS;
+        touch();
+      }
       res.json({
         nodeId: paired.nodeId, tokenFile: file, configPath, backup: written.backup,
-        closingInSec: Math.round(POST_PAIR_GRACE_MS / 1000),
+        ...(resident ? { restarting: true } : { closingInSec: Math.round(POST_PAIR_GRACE_MS / 1000) }),
       });
+      // 常驻进程手里还攥着**旧**的节点身份，重新配对之后那份已经作废了。
+      // 让它退出、由 supervisor 用新令牌拉起来，比在运行中热替换身份简单也可靠得多。
+      if (resident) options.onPaired?.();
     } catch (e) {
       next(e);
     }
-  });
-
-  app.post("/api/finish", guard, (_req, res) => {
-    res.json({ ok: true });
-    finish();
   });
 
   app.use((error: Error, _req: Request, res: Response, _next: NextFunction) => {
     res.status(400).json({ error: error?.message ?? "未知错误" });
   });
 
-  process.stdout.write(`本机配置接口已就绪：${endpoint}\n`);
-  if (consoleURL) {
-    process.stdout.write(`在 Galaxy 控制台里完成配对：${consoleURL}\n`);
+  return {
+    port,
+    token: resident ? undefined : token,
+    consoleURL,
+    pinnedHub,
+    close: finish,
+    closed: once(server, "close"),
+  };
+}
+
+/** CLI 的 `ai-bridge pool setup`：起临时接口、把地址打出来、等它自己退出。 */
+export async function runSetup(options: SetupOptions = {}): Promise<void> {
+  const handle = await startSetupServer({ ...options, resident: false });
+  process.stdout.write(`本机配置接口已就绪：http://127.0.0.1:${handle.port}\n`);
+  if (handle.consoleURL) {
+    process.stdout.write(`在 Galaxy 控制台里完成配对：${handle.consoleURL}\n`);
   } else {
     // 连 Hub 地址都没有（pool 段还没配过）。把参数原样给出来让用户自己拼 ——
     // 没有这两个值，控制台就找不到本机接口，向导等于白起。
     process.stdout.write("没有控制台地址（--console / AI_BRIDGE_CONSOLE_URL）。把下面这段接到你的控制台地址后面：\n");
-    process.stdout.write(`  /provider/overview?bridge=${port}&t=${token}\n`);
+    process.stdout.write(`  /provider/overview#bridge=${handle.port}&t=${handle.token}\n`);
   }
   process.stdout.write("接口只监听本机、只认这一个令牌，配置完成或 15 分钟无操作后自动退出。\n");
-  if (!pinnedHub) {
+  if (!handle.pinnedHub) {
     process.stdout.write("注意：这台机器还没配过 Hub，本次配对接受浏览器填入的任意平台地址。\n");
     process.stdout.write("      配过一次之后就会锁死，之后要换 Hub 得带 --hub 重跑。\n");
   }
-  if (options.open !== false && consoleURL) openBrowser(consoleURL);
+  if (options.open !== false && handle.consoleURL) openBrowser(handle.consoleURL);
 
-  await once(server, "close");
+  await handle.closed;
   process.stdout.write("配置接口已退出。\n");
 }
 
