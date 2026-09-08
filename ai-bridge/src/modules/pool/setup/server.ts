@@ -14,7 +14,6 @@ import type { AppConfig } from "../../../config/schema.js";
 import { probe } from "../probe.js";
 import { HubClient } from "../client.js";
 import { fingerprint, readNodeIdentity, resolveNodeTokenFile, writeNodeIdentity } from "../token.js";
-import { setupPage } from "./page.js";
 
 // pool setup：本机的**配对**向导。
 //
@@ -25,14 +24,18 @@ import { setupPage } from "./page.js";
 // 而不是每次都得回到这台机器上跑一遍命令。本机只保留两件 Hub 做不了的事：
 // 换令牌（要写本机文件），和探测本机有什么能力（要读本机的订阅登录态）。
 //
-// 界面有两个入口，共用下面这一套接口：
-//   · 本机页面（GET /）—— 与接口同源，没有 CORS、没有混合内容，离线机器也能用，是兜底；
-//   · Galaxy 控制台 —— 跨源直连本机，主人不必在控制台和本机页面之间来回跳。
+// 这里**没有界面**，只有接口。界面全在 Galaxy 控制台（client/galaxy）里，
+// 跨源直连这些接口。插件不再自带一份 HTML —— 两处各维护一套同样的表单和文案，
+// 迟早会漂移，而漂移的那一半没人会发现。
 //
-// 跨源那条要过 CORS 和 Chrome 的 Private Network Access 预检，所以下面显式回了
-// Allow-Private-Network。还有一条治不了的：控制台生产环境是 HTTPS，而这里是
-// http://127.0.0.1 —— Chrome / Firefox 把回环当可信源放行，Safari 更严。
-// 控制台那边连不上时退回本机页面，两个入口的接口完全一样。
+// 跨源全开（Access-Control-Allow-Origin: *）。因此**令牌是唯一的闸**：
+// Host 头校验挡的是 DNS 重绑定，回环绑定挡的是别的机器，两者都挡不住
+// 「用户访问了恶意站点、而那个站点知道令牌」。令牌是 32 字节随机数、只活
+// 15 分钟、随进程消失，但它会出现在终端输出和地址栏里 —— 别把它贴出去。
+//
+// 跨源还要过 Chrome 的 Private Network Access 预检，所以下面显式回了
+// Allow-Private-Network。控制台生产环境是 HTTPS 而这里是 http://127.0.0.1，
+// Chrome / Firefox 把回环当可信源放行，Safari 更严 —— 那条治不了。
 //
 // 为什么只在配对期起、配完就退：pool 模式运行时刻意不监听任何端口（P-15），
 // 「攻击面就是主动连了谁」这条不该为了一次性的配对向导而永久让步。
@@ -65,33 +68,18 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
   app.disable("x-powered-by");
   app.use(express.json({ limit: "256kb" }));
 
-  // 控制台跨源直连本机。放开的只是「跨源脚本能不能读到响应」，下面三道闸一条没减。
+  // 跨源对所有来源开放。控制台可能被部署在任何域名下，枚举不完；鉴权交给令牌。
   //
   // 令牌怎么到控制台手上：pool setup 打印的控制台地址里带着它
   // （?bridge=<端口>&t=<令牌>），控制台页面从自己的 query 里取出来，放进
-  // x-setup-token 发过来。令牌全程只在这台机器的浏览器里，不经过 Hub。
-  const allowedOrigins = consoleOrigins(cfg, options);
-
+  // x-setup-token 发过来。令牌不经过 Hub，只在这台机器的浏览器里。
   app.use((req: Request, res: Response, next: NextFunction) => {
-    const origin = req.headers.origin;
-    // 同源请求（本机那个页面）不带 Origin，什么都不用加。
-    if (!origin) {
-      next();
-      return;
-    }
-    if (!originAllowed(origin, allowedOrigins)) {
-      // 一个 CORS 头都不回：跨源脚本因此读不到响应体，只知道请求失败了。
-      res.status(403).json({ error: "来源不在白名单里" });
-      return;
-    }
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    // 响应随 Origin 变，不声明会被缓存成第一个来访者的那一份。
-    res.setHeader("Vary", "Origin");
+    // 通配符和 Allow-Credentials 互斥，但这里本来就不用 cookie，鉴权走头。
+    // 也因此不需要 Vary: Origin —— 响应不随来源变化。
+    res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "content-type, x-setup-token");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Max-Age", "600");
-    // 刻意**不**发 Allow-Credentials：鉴权走 x-setup-token 头，不靠 cookie。
-    // 发了等于允许别的源带着凭据过来，白担一个用不上的风险。
 
     // Chrome 的 Private Network Access：公网页面打私有网段要多一次预检，
     // 少这一条预检就直接失败，业务请求根本发不出去。
@@ -134,8 +122,14 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
   const server = app.listen(wanted, "127.0.0.1");
   await listening(server, wanted);
   const port = (server.address() as AddressInfo).port;
-  const url = `http://127.0.0.1:${port}/?t=${token}`;
-  const consoleURL = buildConsoleURL(options.consoleURL ?? process.env.AI_BRIDGE_CONSOLE_URL, port, token);
+  const endpoint = `http://127.0.0.1:${port}`;
+  // 控制台地址的三个来源，由近及远：命令行 → 环境变量 → 配置里的 Hub 源
+  // （控制台与 Hub 同源部署是最常见的形态，装完就能直接用）。
+  const consoleURL = buildConsoleURL(
+    options.consoleURL ?? process.env.AI_BRIDGE_CONSOLE_URL ?? options.hubURL ?? cfg.pool?.hubURL,
+    port,
+    token,
+  );
 
   const finish = () => {
     if (closing) return;
@@ -153,15 +147,10 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
   };
   touch();
 
-  app.get("/", (req, res) => {
-    // 页面本身不校验令牌 —— 它不吐任何数据，令牌是它要交给脚本的东西。
-    // 真正的闸在 /api/*。
-    if (!isLoopback(req.socket.remoteAddress) || !isLocalHost(req.headers.host)) {
-      res.status(403).send("只允许本机访问");
-      return;
-    }
-    touch();
-    res.type("html").send(setupPage(token));
+  // 界面搬走之后这里不再吐 HTML。留一句话是因为老流程打印过带 /?t= 的地址，
+  // 书签和终端历史里还有 —— 直接 404 会让人以为装坏了。
+  app.get("/", (_req, res) => {
+    res.type("text").send("ai-bridge 配置接口。界面在 Galaxy 控制台的「加入共享池」里。");
   });
 
   app.get("/api/state", guard, async (_req, res, next) => {
@@ -216,17 +205,20 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
     res.status(400).json({ error: error?.message ?? "未知错误" });
   });
 
-  process.stdout.write(`配置向导已启动：${url}\n`);
+  process.stdout.write(`本机配置接口已就绪：${endpoint}\n`);
   if (consoleURL) {
-    process.stdout.write(`也可以在 Galaxy 控制台里配：${consoleURL}\n`);
+    process.stdout.write(`在 Galaxy 控制台里完成配对：${consoleURL}\n`);
+  } else {
+    // 连 Hub 地址都没有（pool 段还没配过）。把参数原样给出来让用户自己拼 ——
+    // 没有这两个值，控制台就找不到本机接口，向导等于白起。
+    process.stdout.write("没有控制台地址（--console / AI_BRIDGE_CONSOLE_URL）。把下面这段接到你的控制台地址后面：\n");
+    process.stdout.write(`  /provider/overview?bridge=${port}&t=${token}\n`);
   }
-  process.stdout.write("它只监听本机、只接受这一个地址里的令牌，配置完成或 15 分钟无操作后自动退出。\n");
-  // 只在明确配了控制台地址时才开控制台那个：没配的话默认值是 Hub 的源，
-  // 开发环境下 Hub 和控制台并不同源，开过去是个 404，不如开本机页面。
-  if (options.open !== false) openBrowser(consoleURL ?? url);
+  process.stdout.write("接口只监听本机、只认这一个令牌，配置完成或 15 分钟无操作后自动退出。\n");
+  if (options.open !== false && consoleURL) openBrowser(consoleURL);
 
   await once(server, "close");
-  process.stdout.write("配置向导已退出。\n");
+  process.stdout.write("配置接口已退出。\n");
 }
 
 // ---------- 配置写回 ----------
@@ -299,58 +291,13 @@ async function pairedState(cfg: AppConfig): Promise<{ paired: boolean; nodeId?: 
 // ---------- 小工具 ----------
 
 /**
- * 这个源能不能跨源调本机向导。
- *
- * **导出是为了能单测。** 这是整个跨域改动里唯一一条安全判定，埋在闭包里就只能靠
- * 起一个真服务来验，回归成本高到不会有人补 —— 而它恰恰是最不能悄悄写错的一段。
- *
- * 回环源一律放行：能从 127.0.0.1 发起请求的页面本来就跑在这台机器上，而且令牌
- * 那道闸还在。开发时控制台在 :7898、Hub 在 :10004，是两个不同的源，
- * 写死任何一个都会在另一种部署下失效。
- */
-export function originAllowed(origin: string, allowed: ReadonlySet<string>): boolean {
-  if (allowed.has(origin)) return true;
-  try {
-    const { hostname: name } = new URL(origin);
-    return name === "127.0.0.1" || name === "localhost" || name === "::1";
-  } catch {
-    // 解析不了的 Origin 一律不认。浏览器不会发出这种东西，能发的都不是浏览器。
-    return false;
-  }
-}
-
-/**
- * 允许跨源过来的控制台源。
- *
- * 默认只有 Hub 自己那个源 —— 控制台与 Hub 同源部署是最常见的形态。部署方把控制台
- * 放在别的域名下时，用 --console <地址> 或 AI_BRIDGE_CONSOLE_ORIGINS=<源,源> 补进来。
- * 回环源不在这里，由 originAllowed 单独放行（开发时端口不固定，枚举不完）。
- */
-export function consoleOrigins(cfg: AppConfig, options: SetupOptions): Set<string> {
-  const result = new Set<string>();
-  const add = (value: string | undefined) => {
-    const text = value?.trim();
-    if (!text) return;
-    try {
-      result.add(new URL(text).origin);
-    } catch {
-      // 写错的地址直接忽略：为一个填错的白名单项让整个向导起不来不划算。
-    }
-  };
-  add(options.hubURL ?? cfg.pool?.hubURL);
-  add(options.consoleURL ?? process.env.AI_BRIDGE_CONSOLE_URL);
-  for (const item of (process.env.AI_BRIDGE_CONSOLE_ORIGINS ?? "").split(",")) add(item);
-  return result;
-}
-
-/**
  * 控制台入口地址：把端口和一次性令牌带过去，控制台页面靠它们直连本机。
  *
  * 令牌放 query 而不是 fragment：控制台要在服务端渲染前就拿到它做首屏请求，
  * 而 fragment 根本不会发给服务器。它只在本机浏览器和本机服务之间流转，
  * 且 15 分钟后连服务本身都没了。
  */
-function buildConsoleURL(base: string | undefined, port: number, token: string): string | undefined {
+export function buildConsoleURL(base: string | undefined, port: number, token: string): string | undefined {
   const text = base?.trim();
   if (!text) return undefined;
   try {
