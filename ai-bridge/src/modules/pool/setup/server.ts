@@ -47,6 +47,11 @@ const IDLE_SHUTDOWN_MS = 15 * 60 * 1000;
 // 不悄悄换一个 —— 换了控制台就连到一个不存在的地方，还查不出原因。
 const DEFAULT_SETUP_PORT = 39217;
 
+// 配对成功后的收尾窗口。配完就没有任何理由再敞着 15 分钟 —— 那段时间里
+// 令牌一旦泄漏（截图、地址栏、日志），别人就能拿它改这台机器的配置。
+// 留 30 秒是给控制台刷一次能力清单、让主人看一眼，不是给人操作用的。
+const POST_PAIR_GRACE_MS = 30_000;
+
 export interface SetupOptions {
   configPath?: string;
   hubURL?: string;
@@ -64,6 +69,17 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
   const cfg = loadConfig(configPath, process.env);
 
   const token = randomBytes(32).toString("hex");
+
+  // 允许配对到哪个 Hub，**在启动时就定死**，不接受请求体里现编的地址。
+  //
+  // 挡的是这条：令牌一旦泄漏（截图、地址栏、服务器日志），拿到它的人可以调
+  // /api/join 传自己的 hubURL —— 他自己的 Hub 当然认任何配对码 —— 于是这台机器的
+  // node-token 和 config 被改写，下次启动就去给他干活，用的是主人的订阅额度。
+  // 装了 LaunchAgent 之后那个「下次启动」还是开机自动发生的。
+  //
+  // 首次配对的机器没有可锁的值（init 的模板里没有 pool 段），那时锁不了也不该锁死：
+  // 还没配上任何东西的机器没有可偷的。所以有就锁，没有就在启动时说清楚。
+  const pinnedHub = originOf(options.hubURL ?? cfg.pool?.hubURL);
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "256kb" }));
@@ -118,6 +134,7 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
 
   let closing = false;
   let idleTimer: NodeJS.Timeout | undefined;
+  let idleMs = IDLE_SHUTDOWN_MS;
   const wanted = options.port ?? DEFAULT_SETUP_PORT;
   const server = app.listen(wanted, "127.0.0.1");
   await listening(server, wanted);
@@ -141,9 +158,9 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
   const touch = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      log.warn("pool_setup_idle_timeout", { minutes: IDLE_SHUTDOWN_MS / 60000 });
+      log.warn("pool_setup_idle_timeout", { seconds: Math.round(idleMs / 1000) });
       finish();
-    }, IDLE_SHUTDOWN_MS);
+    }, idleMs);
   };
   touch();
 
@@ -176,6 +193,11 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
     touch();
     try {
       const hubURL = requireString(req.body?.hubURL, "平台地址");
+      if (pinnedHub && originOf(hubURL) !== pinnedHub) {
+        throw new Error(
+          `这台机器只能配对到 ${pinnedHub}。要换一个 Hub，请在本机重跑：ai-bridge pool setup --hub <新地址>`,
+        );
+      }
       const code = requireString(req.body?.code, "配对码");
       const displayName = String(req.body?.displayName ?? "").trim() || hostname();
       const contractVersion = cfg.pool?.contract ?? 1;
@@ -190,7 +212,13 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
       // 这是本机配置**唯一**还需要写的东西 —— 共享什么、共享多少都在控制台。
       const written = await writePoolConnection(configPath, hubURL);
       log.info("pool_setup_paired", { nodeId: paired.nodeId, fingerprint: fingerprint(paired.token) });
-      res.json({ nodeId: paired.nodeId, tokenFile: file, configPath, backup: written.backup });
+      // 配完就收尾。剩下的只有「让主人看一眼探到了什么」，30 秒够了。
+      idleMs = POST_PAIR_GRACE_MS;
+      touch();
+      res.json({
+        nodeId: paired.nodeId, tokenFile: file, configPath, backup: written.backup,
+        closingInSec: Math.round(POST_PAIR_GRACE_MS / 1000),
+      });
     } catch (e) {
       next(e);
     }
@@ -215,6 +243,10 @@ export async function runSetup(options: SetupOptions = {}): Promise<void> {
     process.stdout.write(`  /provider/overview?bridge=${port}&t=${token}\n`);
   }
   process.stdout.write("接口只监听本机、只认这一个令牌，配置完成或 15 分钟无操作后自动退出。\n");
+  if (!pinnedHub) {
+    process.stdout.write("注意：这台机器还没配过 Hub，本次配对接受浏览器填入的任意平台地址。\n");
+    process.stdout.write("      配过一次之后就会锁死，之后要换 Hub 得带 --hub 重跑。\n");
+  }
   if (options.open !== false && consoleURL) openBrowser(consoleURL);
 
   await once(server, "close");
@@ -293,17 +325,22 @@ async function pairedState(cfg: AppConfig): Promise<{ paired: boolean; nodeId?: 
 /**
  * 控制台入口地址：把端口和一次性令牌带过去，控制台页面靠它们直连本机。
  *
- * 令牌放 query 而不是 fragment：控制台要在服务端渲染前就拿到它做首屏请求，
- * 而 fragment 根本不会发给服务器。它只在本机浏览器和本机服务之间流转，
- * 且 15 分钟后连服务本身都没了。
+ * 放 **fragment** 而不是 query：fragment 永远不会发给服务器。用 `?t=` 的话，
+ * 每次打开这个页面令牌都会进控制台服务器的访问日志（开发时是 Next dev server，
+ * 生产还要加上反代和 CDN）—— 那是几个泄漏渠道里唯一一个主人完全察觉不到的。
+ * 它也不会出现在 Referer 里。
+ *
+ * 读取端是纯客户端的（readBridgeConn 有 window 守卫、在 effect 里调），
+ * 服务端渲染不需要这两个值，所以 fragment 够用。
  */
 export function buildConsoleURL(base: string | undefined, port: number, token: string): string | undefined {
   const text = base?.trim();
   if (!text) return undefined;
   try {
     const target = new URL("/provider/overview", text);
-    target.searchParams.set("bridge", String(port));
-    target.searchParams.set("t", token);
+    // 用 URLSearchParams 生成 fragment 内容，转义交给它 —— 手拼的话令牌里
+    // 万一出现 & 就会把参数截断（当前是十六进制不会，但别靠「不会」活着）。
+    target.hash = new URLSearchParams({ bridge: String(port), t: token }).toString();
     return target.toString();
   } catch {
     return undefined;
@@ -323,6 +360,16 @@ function listening(server: Server, port: number): Promise<void> {
       );
     });
   });
+}
+
+// originOf 只取协议+主机+端口。Hub 地址可能带路径（自建部署挂在子路径下），
+// 比对必须按源来，否则同一个 Hub 写法差一个尾斜杠就配不上。
+export function originOf(value: string | undefined): string {
+  try {
+    return new URL(String(value ?? "")).origin;
+  } catch {
+    return "";
+  }
 }
 
 function isLoopback(address: string | undefined): boolean {

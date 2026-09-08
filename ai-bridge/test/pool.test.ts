@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseConfig } from "../src/config/index.js";
 import { Lane } from "../src/modules/pool/lane.js";
+import { sleep } from "../src/modules/pool/runner.js";
 import { modelMatch, inlineJSON, inlineText, type WorkUnit } from "../src/business/core/index.js";
 import type { ContributionDeclaration } from "../src/modules/pool/client.js";
 import type { Provider } from "../src/business/core/index.js";
@@ -211,4 +212,18 @@ test("同一节点可以同时贡献中转与本机执行两种能力", () => {
   assert.equal(cfg.pool?.contributions.length, 2);
   // 未贡献的能力不加载：主人没勾的东西，代码都不该被 import（X-03）。
   assert.equal(cfg.pool?.contributions[1].exec?.command, "/bin/worker");
+});
+
+test("sleep 的定时器必须保活事件循环", async () => {
+  // 守一个静默故障：sleep 曾经写成 setTimeout(...).unref()，于是每一个重试循环
+  // （hello 重连、心跳、取任务退避）都不再保活。连不上 Hub 时事件循环直接空掉，
+  // 进程**以退出码 0** 消失，supervisor 看到「正常退出」又拉起来 —— 变成固定间隔
+  // 的重启循环，而控制台上这台机器一直显示离线；退出码 0 还会骗过 Restart=on-failure。
+  //
+  // 把 unref 加回去不会让任何别的测试变红（它们不跑真实循环），所以只能钉在这里。
+  const count = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  const before = count();
+  const pending = sleep(30);
+  assert.equal(count(), before + 1, "sleep 的定时器没有保活事件循环（多半是又被 unref 了）");
+  await pending;
 });

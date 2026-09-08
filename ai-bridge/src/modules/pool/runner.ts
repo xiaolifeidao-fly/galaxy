@@ -364,9 +364,10 @@ export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
 
   return {
     async start() {
-      for (;;) {
+      for (let attempt = 1; ; attempt += 1) {
         try {
           await sayHello();
+          if (attempt > 1) log.info("pool_hello_recovered", { attempt });
           break;
         } catch (e) {
           if (e instanceof ContractMismatchError) {
@@ -374,8 +375,21 @@ export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
             log.error("pool_contract_mismatch", { message: e.message });
             throw e;
           }
-          log.warn("pool_hello_failed", { message: (e as Error)?.message });
-          await sleep(RECONNECT_MIN_MS);
+          const message = (e as Error)?.message ?? "";
+          // 令牌被拒不是网络抖动，重试多少次都不会自己好。但也**不能直接退出**：
+          // 主人很可能正在控制台里重新配对，进程活着才能在配对完之后自动接上。
+          // 所以只把「该怎么办」在第一次就说清楚，之后退避到上限，别每秒刷一条。
+          if (/令牌无效|未授权|已撤销|revoked|unauthorized/i.test(message) && attempt === 1) {
+            log.error("pool_node_token_rejected", {
+              message,
+              hint: "这台机器的节点令牌 Hub 不认了。在 Galaxy 控制台重新配对：ai-bridge pool setup",
+            });
+          } else {
+            log.warn("pool_hello_failed", { message, attempt });
+          }
+          // 指数退避封顶：连不上 Hub 时不该把日志和 CPU 都刷满。
+          const wait = Math.min(RECONNECT_MIN_MS * 2 ** Math.min(attempt - 1, 6), RECONNECT_MAX_MS);
+          await sleep(wait);
         }
       }
       void heartbeatLoop();
@@ -545,6 +559,17 @@ async function readVersion(): Promise<string> {
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms).unref?.());
+/**
+ * 定时器**不能** unref。
+ *
+ * 这里的每一次 sleep 都在一个「进程活着就该继续转」的循环里：hello 重连、心跳、
+ * 取任务退避。unref 掉之后，只要所有循环同时处在 sleep 上、又没有在途请求撑着，
+ * 事件循环就空了，Node 会**以退出码 0 干净退出** —— 表现为节点连不上 Hub 时
+ * 直接消失，而 supervisor 看到「正常退出」又把它拉起来，变成固定间隔的重启循环，
+ * 控制台上这台机器则一直是离线。退出码 0 还会骗过 Restart=on-failure 这类策略。
+ *
+ * 停止不靠事件循环耗尽，靠 stop() 里的 abort + 显式 process.exit。
+ */
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

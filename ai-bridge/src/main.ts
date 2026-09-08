@@ -83,12 +83,11 @@ async function cmdStart(argv: string[]) {
 // pool 模式不监听任何端口：进程只有出站连接，攻击面就是「主动连了谁」（P-15）。
 async function startPool(cfg: Awaited<ReturnType<typeof loadConfig>>) {
   const runner = await createPoolRunner(cfg);
-  await runner.start();
 
-  const pidFile = join(runtimeDir(), "ai-bridge.pid");
-  await mkdir(dirname(pidFile), { recursive: true, mode: 0o700 });
-  await writeFile(pidFile, String(process.pid) + "\n");
-
+  // 信号与异常处理必须**先于** runner.start()。start() 要等 hello 成功才返回，
+  // 而连不上 Hub（令牌过期、Hub 在维护）时它会在重试循环里待很久 —— 装在后面的话，
+  // 这整段时间里 SIGTERM 没人处理（supervisor 只好 SIGKILL），
+  // 任何 stray rejection 也没人记，进程会静悄悄地消失。
   const shutdown = async (sig: string) => {
     log.info("signal", { signal: sig });
     await runner.stop();
@@ -98,6 +97,14 @@ async function startPool(cfg: Awaited<ReturnType<typeof loadConfig>>) {
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("unhandledRejection", (reason) => log.error("unhandled_rejection", { reason: String(reason) }));
   process.on("uncaughtException", (err) => log.error("uncaught_exception", { message: err.message, stack: err.stack }));
+
+  // pid 文件同理要早写：留到 start() 之后的话，重试期间外面看不到这个进程，
+  // service.sh / start.sh 的存活判断会把「正在重连」误判成「没起来」。
+  const pidFile = join(runtimeDir(), "ai-bridge.pid");
+  await mkdir(dirname(pidFile), { recursive: true, mode: 0o700 });
+  await writeFile(pidFile, String(process.pid) + "\n");
+
+  await runner.start();
 }
 
 async function cmdPool(argv: string[]) {
