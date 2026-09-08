@@ -247,6 +247,17 @@ test("去重并排序：同一个模型在分页结果里出现两次不该变�
   assert.deepEqual(parseModels({ data: [{ id: "b" }, { id: "a" }, { id: "b" }] }), ["a", "b"]);
 });
 
+test("认 Codex 后端的 {models:[{slug}]} 形状", () => {
+  // 这一条是踩过的坑：Codex 返回的条目用 slug 不用 id。只认 id 的话请求明明
+  // 成功了、解析出来还是空，而日志里什么异常都没有 —— 最难查的那种。
+  const models = parseModels({ models: [{ slug: "gpt-5.5" }, { slug: "gpt-5.4-mini" }] });
+  assert.deepEqual(models, ["gpt-5.4-mini", "gpt-5.5"]);
+});
+
+test("id 和 slug 混着来也认", () => {
+  assert.deepEqual(parseModels({ data: [{ id: "a" }, { slug: "b" }] }), ["a", "b"]);
+});
+
 test("认不出来的形状一律当空，不猜", () => {
   // 猜错的模型名比没有更糟：主人会照着它配出一条永远匹配不上的规则，
   // 然后以为是共享池坏了。
