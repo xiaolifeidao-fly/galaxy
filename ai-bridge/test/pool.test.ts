@@ -4,6 +4,7 @@ import { parseConfig } from "../src/config/index.js";
 import { Lane } from "../src/modules/pool/lane.js";
 import { healthSignature, sleep } from "../src/modules/pool/runner.js";
 import { parseModels } from "../src/modules/pool/models.js";
+import { parseVersion } from "../src/modules/pool/tools.js";
 import { modelMatch, inlineJSON, inlineText, type WorkUnit } from "../src/business/core/index.js";
 import type { ContributionDeclaration } from "../src/modules/pool/client.js";
 import type { Provider } from "../src/business/core/index.js";
@@ -300,4 +301,29 @@ test("顺序不影响指纹：探测返回顺序变了不该触发一次无谓�
 test("完全没变时指纹相同", () => {
   const rows = [report("x", true), report("y", false, "r")];
   assert.equal(healthSignature(rows), healthSignature([...rows]));
+});
+
+// ---------- 工具版本解析 ----------
+//
+// 三个 CLI 的 --version 输出格式各不相同，而且随时可能改。解析错了不会报错，
+// 只会让面板显示空版本、或者把「已是最新」误判成「可升级」（反过来更糟：
+// 明明有新版却不提示）。
+
+test("认得各 CLI 的 --version 输出格式", () => {
+  assert.equal(parseVersion("codex-cli 0.153.4"), "0.153.4");
+  assert.equal(parseVersion("2.1.263 (Claude Code)"), "2.1.263");
+  assert.equal(parseVersion("1.2.3"), "1.2.3");
+  assert.equal(parseVersion("v0.9.1\n"), "0.9.1");
+});
+
+test("认预发布版本号", () => {
+  assert.equal(parseVersion("codex-cli 1.0.0-beta.2"), "1.0.0-beta.2");
+});
+
+test("认不出来返回空串，绝不瞎猜", () => {
+  // 空串会让 upgradable 判成 false —— 拿不到版本时**不催人升级**，
+  // 比显示一个猜来的版本号安全。
+  for (const junk of ["", "unknown", "命令未找到", "codex-cli"]) {
+    assert.equal(parseVersion(junk), "", `不该从 ${JSON.stringify(junk)} 解析出版本`);
+  }
 });

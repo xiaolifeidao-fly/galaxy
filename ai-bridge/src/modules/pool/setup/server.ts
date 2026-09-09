@@ -13,6 +13,7 @@ import { loadConfig } from "../../../config/index.js";
 import type { AppConfig } from "../../../config/schema.js";
 import { probe } from "../probe.js";
 import { CredentialRegistry } from "../../../credentials/index.js";
+import { toolStatuses, upgradeTool } from "../tools.js";
 import { HubClient } from "../client.js";
 import { fingerprint, readNodeIdentity, resolveNodeTokenFile, writeNodeIdentity } from "../token.js";
 
@@ -294,6 +295,31 @@ export async function startSetupServer(options: SetupOptions = {}): Promise<Setu
    * 即便如此还是收窄了两处：限流，以及**只在凭据确实不可用时才允许拉起** ——
    * 已经登录好的时候拒掉，免得它变成一个随时可用的「开终端」原语。
    */
+  /**
+   * 本机几个工具的版本与可升级状态，给控制台的版本面板用。
+   *
+   * 不鉴权，和 /api/ping 一样 —— 控制台没有会话凭据可用。代价是任何本机页面
+   * 都能读到你装了哪些工具、什么版本，这是个指纹。可用性收益大于这点泄漏，
+   * 但值得知道：它比 ping 多吐了三个版本号。
+   */
+  app.get("/api/tools", localOnly, async (_req, res, next) => {
+    try {
+      res.json({ tools: await toolStatuses() });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  /** 拉起一次升级。命令走固定表，请求体只能传工具名。 */
+  app.post("/api/tools/upgrade", localOnly, rateLimit, async (req, res, next) => {
+    try {
+      const name = requireString(req.body?.tool, "工具名");
+      res.json({ started: true, ...upgradeTool(name) });
+    } catch (e) {
+      next(e);
+    }
+  });
+
   app.post("/api/upstream/login", localOnly, rateLimit, async (req, res, next) => {
     try {
       const name = requireString(req.body?.provider, "上游名称");
