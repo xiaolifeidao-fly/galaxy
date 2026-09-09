@@ -163,8 +163,10 @@ async function cmdPool(argv: string[]) {
     const client = new HubClient(cfg.pool.hubURL, cfg.pool.contract);
     const pkg = JSON.parse(await readFile(join(pkgRoot, "package.json"), "utf8")) as { version?: string };
     const displayName = arg("--name", argv) ?? hostname();
-    const result = await client.pair(code, displayName, pkg.version ?? "0.0.0");
     const file = resolveNodeTokenFile(cfg.pool);
+    // 同上：旧身份要在覆盖之前读出来，好让 Hub 把上一台退役掉。
+    const previous = await readNodeIdentity(file);
+    const result = await client.pair(code, displayName, pkg.version ?? "0.0.0", previous?.nodeId);
     await writeNodeIdentity(file, {
       version: 1, nodeId: result.nodeId, token: result.token,
       hubURL: cfg.pool.hubURL, pairedAt: new Date().toISOString(),

@@ -120,11 +120,23 @@ export class HubClient {
   }
 
   // pair 用一次性配对码换长期节点令牌。明文只在这一次返回。
-  async pair(code: string, displayName: string, bridgeVersion: string): Promise<{ nodeId: string; token: string }> {
+  /**
+   * 用配对码换长期节点令牌。
+   *
+   * previousNodeId 是这台机器**上一次**配对拿到的 nodeId。Hub 每次配对都新建节点，
+   * 不把旧的告诉它，同一台机器每重配一次就在控制台多一个永远离线的僵尸。
+   * Hub 会校验它属于同一个主人才退役，传错了只是不生效，不会伤到别人的机器。
+   */
+  async pair(
+    code: string,
+    displayName: string,
+    bridgeVersion: string,
+    previousNodeId?: string,
+  ): Promise<{ nodeId: string; token: string }> {
     const response = await fetch(this.url("/agent/v1/pair"), {
       method: "POST",
       headers: { "content-type": "application/json", "x-galaxy-contract": String(this.contractVersion) },
-      body: JSON.stringify({ code, displayName, bridgeVersion }),
+      body: JSON.stringify({ code, displayName, bridgeVersion, ...(previousNodeId ? { previousNodeId } : {}) }),
     });
     const payload = await readJSON(response);
     if (!response.ok) throw hubError(response.status, payload);

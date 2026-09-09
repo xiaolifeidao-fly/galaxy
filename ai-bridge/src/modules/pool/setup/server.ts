@@ -368,8 +368,10 @@ export async function startSetupServer(options: SetupOptions = {}): Promise<Setu
       const displayName = String(req.body?.displayName ?? "").trim() || hostname();
       const contractVersion = cfg.pool?.contract ?? 1;
       const client = new HubClient(hubURL, contractVersion);
-      const paired = await client.pair(code, displayName, await bridgeVersion());
       const file = resolveNodeTokenFile(cfg.pool);
+      // 先读旧身份再配对：配对成功后这个文件就被覆盖了，那时再读已经晚了。
+      const previous = await readNodeIdentity(file);
+      const paired = await client.pair(code, displayName, await bridgeVersion(), previous?.nodeId);
       await writeNodeIdentity(file, {
         version: 1, nodeId: paired.nodeId, token: paired.token,
         hubURL, pairedAt: new Date().toISOString(),
