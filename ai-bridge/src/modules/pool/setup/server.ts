@@ -12,6 +12,7 @@ import { defaultConfigPath } from "../../../core/paths.js";
 import { loadConfig } from "../../../config/index.js";
 import type { AppConfig } from "../../../config/schema.js";
 import { probe } from "../probe.js";
+import { CredentialRegistry } from "../../../credentials/index.js";
 import { HubClient } from "../client.js";
 import { fingerprint, readNodeIdentity, resolveNodeTokenFile, writeNodeIdentity } from "../token.js";
 
@@ -71,6 +72,18 @@ export interface SetupOptions {
   onPaired?: () => void;
 }
 
+/**
+ * authMode → 拉起登录的命令。
+ *
+ * **只认这张表。** 请求体里只能传上游的名字，命令由本机配置里那个上游自己的
+ * authMode 决定 —— 否则这就是个「让任意网站在你机器上跑任意命令」的接口。
+ * api_key 不在表里：那种上游的凭据是写在配置里的，没有可拉起的登录流程。
+ */
+const LOGIN_COMMANDS: Record<string, string[]> = {
+  claude_oauth: ["claude", "auth", "login"],
+  codex_chatgpt: ["codex", "login"],
+};
+
 /** 常驻模式下 /api/join 的限流窗口：它没有令牌闸，只有配对码。 */
 const PAIR_WINDOW_MS = 60_000;
 const PAIR_MAX_PER_WINDOW = 10;
@@ -108,6 +121,8 @@ export async function startSetupServer(options: SetupOptions = {}): Promise<Setu
     throw new Error(`还没有配置文件：${configPath}（先运行 ai-bridge init）`);
   }
   const cfg = loadConfig(configPath, process.env);
+  // 解析上游凭据用；/api/upstream/login 靠它判断「是不是真的不可用」。
+  const credentials = new CredentialRegistry();
 
   // 常驻模式不发令牌：那一档靠配对码鉴权，见上面的说明。
   const token = resident ? "" : randomBytes(32).toString("hex");
@@ -263,6 +278,55 @@ export async function startSetupServer(options: SetupOptions = {}): Promise<Setu
       finish();
     });
   }
+
+  /**
+   * 拉起某个上游的登录流程。
+   *
+   * 为什么要有这个：Claude 登录态过期时，控制台能看到「不可用 + 请运行 claude auth
+   * login」，但主人得自己找到那台机器、开终端、敲命令。有了它，点一下就把终端开起来。
+   *
+   * 为什么开**终端窗口**而不是直接 spawn：`claude auth login` 是交互式的，要给用户看
+   * 授权链接、可能还要粘贴回码。而 bridge 是 LaunchAgent，没有 TTY —— headless 起它
+   * 只会挂在那儿。开一个真终端是唯一稳的做法，开不起来就把命令回给控制台让人自己敲。
+   *
+   * 鉴权：这个端点没有令牌闸（常驻接口本来就没有）。能接受是因为它对攻击者没有收益 ——
+   * 授权完成后凭据进的是**主人自己的** keychain，攻击者拿不到任何东西，最多是骚扰。
+   * 即便如此还是收窄了两处：限流，以及**只在凭据确实不可用时才允许拉起** ——
+   * 已经登录好的时候拒掉，免得它变成一个随时可用的「开终端」原语。
+   */
+  app.post("/api/upstream/login", localOnly, rateLimit, async (req, res, next) => {
+    try {
+      const name = requireString(req.body?.provider, "上游名称");
+      const provider = cfg.providers[name];
+      if (!provider) throw new Error(`本机配置里没有这个上游：${name}`);
+      const argv = provider.authMode ? LOGIN_COMMANDS[provider.authMode] : undefined;
+      if (!argv) {
+        throw new Error(
+          `${name} 的登录方式是 ${provider.authMode ?? "未配置"}，没有可拉起的登录命令`,
+        );
+      }
+      // 已经好了就不给拉：这一条把它从「通用开终端接口」收窄成「修不可用状态」。
+      try {
+        const credential = credentials.resolve(provider);
+        await credential.headers({
+          header: () => undefined,
+          principal: { alias: "probe", scopes: new Set(["*"] as const), source: "anonymous" },
+          requestId: "upstream-login",
+          provider,
+          providerName: name,
+        });
+        res.json({ command: argv.join(" "), launched: false, alreadyAuthorized: true });
+        return;
+      } catch {
+        // 解析不了才继续 —— 这正是要修的状态。
+      }
+      const command = argv.join(" ");
+      log.info("pool_upstream_login_launch", { provider: name, command });
+      res.json({ command, launched: openTerminal(command) });
+    } catch (e) {
+      next(e);
+    }
+  });
 
   app.post("/api/join", localOnly, rateLimit, guard, async (req, res, next) => {
     touch();
@@ -499,6 +563,29 @@ async function bridgeVersion(): Promise<string> {
     return (JSON.parse(raw) as { version?: string }).version ?? "0.0.0";
   } catch {
     return "0.0.0";
+  }
+}
+
+/**
+ * 在一个真终端窗口里跑命令，给交互式登录用。
+ *
+ * 只做 macOS：Linux 的终端模拟器五花八门（gnome-terminal / konsole /
+ * x-terminal-emulator …），挨个试一遍还经常猜错，不如老实返回 false，
+ * 让控制台把命令显示出来让人自己敲 —— 那条路在所有平台上都是通的。
+ *
+ * command 全部来自 LOGIN_COMMANDS 这张固定表，不含任何外部输入，所以这里
+ * 拼进 osascript 是安全的；哪天要接受外部参数，这里必须先加转义。
+ */
+function openTerminal(command: string): boolean {
+  if (process.platform !== "darwin") return false;
+  try {
+    spawn("/usr/bin/osascript", [
+      "-e", `tell application "Terminal" to do script ${JSON.stringify(command)}`,
+      "-e", 'tell application "Terminal" to activate',
+    ], { stdio: "ignore", detached: true }).unref();
+    return true;
+  } catch {
+    return false;
   }
 }
 
