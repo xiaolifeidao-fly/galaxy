@@ -6,11 +6,12 @@ import type { ProviderConfig } from "../../../config/schema.js";
 import { resolveUpstream, type CredentialRegistry } from "../../../credentials/index.js";
 import type { Principal } from "../../../auth/principal.js";
 import { cpus, freemem, totalmem, platform } from "node:os";
+import { prepareClaudeRequest } from "../../../credentials/claude-request.js";
 
-// llm.chat 的节点 provider：用本机订阅登录态把请求原样发给上游，把响应字节原样吐回。
+// llm.chat 的节点 provider：补齐订阅协议要求后转发请求，响应逐字节透传。
 //
 // 与 relay 模块的区别只有「请求从哪来」：那边是本机客户端直连，这边是 Hub 派下来的
-// 工作单元。凭据、透传语义、不解析请求体这些边界完全一致，上游凭据一样不出本机。
+// 工作单元。凭据、订阅协议适配和响应透传的语义完全一致，上游凭据一样不出本机。
 
 const ANTHROPIC_PATHS = new Set(["/v1/messages", "/v1/messages/count_tokens"]);
 
@@ -73,6 +74,7 @@ export class RelayProvider implements Provider {
     // 每个单元重新解析，主人改完 CLI 配置不用重启桥接。
     let authHeaders: Record<string, string>;
     let baseURL: string;
+    let requestBody: Uint8Array = body;
     try {
       const upstream = await resolveUpstream(config);
       if (upstream.wireApi === "chat" && path === "/v1/responses") {
@@ -80,6 +82,7 @@ export class RelayProvider implements Provider {
         return;
       }
       baseURL = upstream.baseURL;
+      requestBody = prepareClaudeRequest(body, config, upstream);
       authHeaders = await credential.headers({
         header: (name) => clientHeaders[name.toLowerCase()] ?? clientHeaders[name],
         // 消费者对节点是匿名的：这里只有 ck_… 这个匿名标识，没有任何身份信息（C-12）。
@@ -110,14 +113,15 @@ export class RelayProvider implements Provider {
           accept: isAnthropic(path) ? "text/event-stream" : "text/event-stream, application/json",
           ...authHeaders,
         },
-        body: new Uint8Array(body),
+        body: new Uint8Array(requestBody),
         signal: controller.signal,
         redirect: "error",
       });
 
       yield { type: "head", status: upstream.status, headers: passthroughHeaders(upstream.headers) };
+      const failure = upstreamFailure(upstream.status, upstream.headers);
       if (!upstream.body) {
-        yield { type: "done", usage: {} };
+        yield failure ?? { type: "done", usage: {} };
         return;
       }
       // 边收边吐：不缓冲整段响应，背压顺着 Hub 一路顶回上游。
@@ -134,7 +138,7 @@ export class RelayProvider implements Provider {
       io.log("relay_upstream_done", { status: upstream.status, bytes, url });
       // usage 交给 Hub 从流里解析。节点这里不重复解析一遍：
       // 自报值只用于对账，多算一次也不会更可信。
-      yield { type: "done", usage: {} as Metering };
+      yield failure ?? { type: "done", usage: {} as Metering };
     } catch (e) {
       if (controller.signal.aborted) {
         yield { type: "error", class: "protocol", code: "unit_cancelled", retryable: false, message: "已取消" };
@@ -153,6 +157,17 @@ export class RelayProvider implements Provider {
   async cancel(unitId: string): Promise<void> {
     this.aborts.get(unitId)?.abort(new Error("cancelled"));
   }
+}
+
+function upstreamFailure(status: number, headers: Headers): Extract<UnitEvent, { type: "error" }> | undefined {
+  if (status < 400) return;
+  const requestId = headers.get("request-id");
+  return {
+    type: "error", class: "upstream_fault",
+    code: status === 429 ? "upstream_429" : status >= 500 ? "upstream_5xx" : "upstream_rejected",
+    retryable: (status === 429 || status >= 500) && headers.get("x-should-retry") !== "false",
+    message: `上游返回 HTTP ${status}${requestId ? `，request-id: ${requestId}` : ""}`,
+  };
 }
 
 const probePrincipal: Principal = { alias: "probe", scopes: new Set(["*"] as const), source: "anonymous" };

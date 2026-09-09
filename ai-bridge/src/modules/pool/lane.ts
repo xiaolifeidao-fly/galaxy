@@ -54,6 +54,15 @@ export class Lane {
     return Math.max(0, this.capacity() - this.inflight);
   }
 
+  // Retry-After 支持秒数和 HTTP 日期。并发中的旧响应不能缩短已有冷却。
+  throttle(retryAfter?: string, now = Date.now()): void {
+    const raw = retryAfter?.trim();
+    const seconds = raw && /^\d+(\.\d+)?$/.test(raw) ? Number(raw) : undefined;
+    const parsed = seconds !== undefined ? now + seconds * 1000 : raw ? Date.parse(raw) : NaN;
+    const until = Number.isFinite(parsed) && parsed > now && parsed <= 8.64e15 ? parsed : now + 120_000;
+    this.throttledUntil = new Date(Math.max(this.throttledUntil?.getTime() ?? 0, until));
+  }
+
   // acquire 占一个执行位。单个消费者在这条通道上的并行数不能超过 seatConcurrency，
   // 否则一个人就能把整台机器占满。
   acquire(consumerKey: string): boolean {

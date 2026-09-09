@@ -318,7 +318,18 @@ export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
       for (;;) {
         const step = await iterator.next();
         if (step.done) break;
-        if (step.value.type === "head") { head = step.value; break; }
+        if (step.value.type === "head") {
+          head = step.value;
+          if (head.status === 429) lane.throttle(head.headers["retry-after"]);
+          if (head.status >= 400) {
+            log.warn("pool_upstream_rejected", {
+              unitId: unit.id, cid: lane.cid, status: head.status,
+              requestId: head.headers["request-id"], retryAfter: head.headers["retry-after"],
+              throttledUntil: lane.throttledUntil?.toISOString(),
+            });
+          }
+          break;
+        }
         if (step.value.type === "error") { outcome.fail(step.value); break; }
         if (step.value.type === "done") { outcome.finish(step.value); break; }
       }

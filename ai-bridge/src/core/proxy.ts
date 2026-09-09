@@ -21,6 +21,7 @@ export async function proxyRelay(opts: {
   signal: AbortSignal;
   requestId: string;
   idleTimeoutMs?: number;
+  requestBody?: Uint8Array;              // 订阅协议适配后的请求体；未提供时逐字节转发
 }): Promise<{ status: number }> {
   const { req, res, baseURL, authHeaders, signal, requestId } = opts;
 
@@ -41,7 +42,7 @@ export async function proxyRelay(opts: {
   };
 
   const rawBody = (req as RawBodyRequest).rawBody;
-  const body = rawBody ? new Uint8Array(rawBody) : JSON.stringify(req.body ?? {});
+  const body = opts.requestBody ? new Uint8Array(opts.requestBody) : rawBody ? new Uint8Array(rawBody) : JSON.stringify(req.body ?? {});
   log.debug("relay_forward", { requestId, url, bytes: body.length });
 
   const relayAbort = new AbortController();

@@ -244,13 +244,31 @@ export async function startSetupServer(options: SetupOptions = {}): Promise<Setu
     res.type("text").send("ai-bridge 配置接口。界面在 Galaxy 控制台的「加入共享池」里。");
   });
 
-  // ping 不鉴权，也**只**回这两个布尔值。控制台靠它判断「本机有没有 ai-bridge 在跑、
-  // 要不要显示配对表单」—— 没有这个探针，控制台就只能靠 URL 参数被动触发，
-  // 也就回到了「只有装插件那一次能配」的老问题。
+  // ping 不鉴权。控制台靠它判断「本机有没有 ai-bridge 在跑、要不要显示配对表单」——
+  // 没有这个探针，控制台就只能靠 URL 参数被动触发，也就回到了「只有装插件那一次能配」
+  // 的老问题。
   // 代价是任何网站都能探出你装了 ai-bridge。这是为可用性付的、有界的代价：
   // 它不吐机器名、不吐能力清单、不吐配置路径，那些都在鉴权后面。
-  app.get("/api/ping", localOnly, async (_req, res) => {
-    res.json({ running: true, resident, ...(await pairedState(cfg)) });
+  //
+  // `?hub=` 是给控制台比对用的，**只回一个布尔值，不回地址**。
+  //
+  // 要解决的问题：节点连错 Hub 时它不会出现在**任何**列表里，控制台上只剩一个
+  // 空列表和消费者那头的「共享池暂无可用算力」，没有一处提示地址不对 ——
+  // 这是最难猜的一种故障。控制台把自己的地址报过来问一句「是不是你连的这个」，
+  // 就足够把它认出来。
+  //
+  // 为什么不干脆回 hubURL：那就成了机器指纹，任何网站都能读出这台机器绑在哪个
+  // 平台上，自建部署尤其敏感。回布尔值的话，提问方必须**先知道**那个地址，
+  // 答案对它就没有新信息了。没带 ?hub= 就完全不回这个字段，行为和以前一模一样。
+  app.get("/api/ping", localOnly, async (req, res) => {
+    const asked = originOf(String(req.query.hub ?? ""));
+    const mine = originOf(options.hubURL ?? cfg.pool?.hubURL);
+    res.json({
+      running: true,
+      resident,
+      ...(asked && mine ? { hubMatches: asked === mine } : {}),
+      ...(await pairedState(cfg)),
+    });
   });
 
   // 能力清单和配置路径是机器指纹，只在临时模式（有令牌）下给。

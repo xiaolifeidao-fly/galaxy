@@ -2,6 +2,8 @@
 
 本机桥接服务（Node ≥ 20 / TypeScript）。用这台机器的 Claude Code / Codex 订阅登录态，把 Anthropic Messages 与 OpenAI Responses 请求原样中转给上游。以 Claude Code / Codex 插件形式分发，`skills/ai-bridge` 教 agent 怎么装、怎么发 token、怎么接客户端。
 
+Claude 官方订阅通道会补齐 OAuth 所需的 beta 头与 system 协议前缀；否则普通 curl / SDK 请求可能被上游以 `429 rate_limit_error: Error` 拒绝。已有的 CLI 前缀不重复添加，客户端 system、消息历史、工具定义与工具结果均保留，响应状态码和 SSE 字节透传。此兼容处理同时用于 relay 和 pool，不启动本地 agent；API key 和自定义中转不受影响。
+
 两种模式，互斥：
 
 | `mode` | 谁在用 | 网络形态 |

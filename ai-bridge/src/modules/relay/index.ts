@@ -3,12 +3,13 @@ import type { AppConfig, Scope } from "../../config/schema.js";
 import type { BridgeContext, BridgeModule } from "../types.js";
 import { getPrincipal } from "../../auth/principal.js";
 import { beginRequest } from "../../core/request.js";
-import { proxyRelay } from "../../core/proxy.js";
+import { proxyRelay, type RawBodyRequest } from "../../core/proxy.js";
 import { describeError, httpError } from "../../core/errors.js";
 import { resolveUpstream } from "../../credentials/index.js";
+import { prepareClaudeRequest } from "../../credentials/claude-request.js";
 
-// relay 模块：把 Anthropic Messages / OpenAI Responses / Chat Completions 原样转发到
-// 用订阅登录态鉴权的上游。桥接不解析请求体、不执行工具。
+// relay 模块：把 Anthropic Messages / OpenAI Responses / Chat Completions 转发到
+// 用订阅登录态鉴权的上游。只补 Claude 订阅协议前缀，不执行客户端工具。
 //
 // 路径 → (协议族, scope, 错误体形态)
 interface PathSpec {
@@ -102,6 +103,7 @@ export function makeRelayHandler(ctx: BridgeContext, path: string, spec: PathSpe
       const { status } = await proxyRelay({
         req, res, baseURL: upstream.baseURL, authHeaders, signal, requestId,
         idleTimeoutMs: ctx.cfg.server.streamIdleTimeoutMs,
+        requestBody: prepareClaudeRequest((req as RawBodyRequest).rawBody ?? Buffer.from(JSON.stringify(req.body ?? {})), pc, upstream),
       });
       ctx.log.info("relay_done", { requestId, alias: principal.alias, status, ms: Date.now() - startedAt });
     } catch (e) {

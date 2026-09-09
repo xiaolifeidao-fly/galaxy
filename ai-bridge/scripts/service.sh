@@ -84,7 +84,7 @@ health_check() {
     return 1
   fi
   if [[ "$first" != "$second" ]]; then
-    echo "ai-bridge 在反复重启（pid $first → $second），多半是配置有问题。看日志：$log_file" >&2
+    echo "ai-bridge 在反复重启（pid ${first} → ${second}），多半是配置有问题。看日志：$log_file" >&2
     return 1
   fi
   # 进程稳住了不等于真的接上了 Hub。令牌被拒时它会一直活着重试（这是对的：
@@ -101,7 +101,7 @@ health_check() {
     echo "ai-bridge 在运行，但契约版本和 Hub 对不上，需要升级插件。看日志：$log_file" >&2
     return 1
   fi
-  echo "ai-bridge 正在运行（pool 模式，pid $second，本机配置接口 127.0.0.1:39217）"
+  echo "ai-bridge 正在运行（pool 模式，pid ${second}，本机配置接口 127.0.0.1:39217）"
   return 0
 }
 
@@ -167,7 +167,7 @@ PLIST
     status)
       pid="$(running_pid "$label")"
       [[ -f "$plist" ]] || { echo "未安装"; exit 1; }
-      [[ -n "$pid" ]] && echo "运行中（$mode 模式，pid $pid）" || { echo "已安装但没在跑。看日志：$log_file"; exit 1; } ;;
+      [[ -n "$pid" ]] && echo "运行中（${mode} 模式，pid ${pid}）" || { echo "已安装但没在跑。看日志：$log_file"; exit 1; } ;;
     *) echo "用法：$0 install|uninstall|restart|status" >&2; exit 2 ;;
   esac
   exit 0

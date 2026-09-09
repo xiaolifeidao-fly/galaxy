@@ -176,11 +176,40 @@ test("常驻模式：ping 不要令牌，且只回布尔值", async () => {
     assert.equal(body.running, true);
     assert.equal(body.resident, true);
     assert.equal(body.paired, false);
-    // 机器指纹一个都不能出现在这个不鉴权的端点上
+    // 机器指纹一个都不能出现在这个不鉴权的端点上。hubURL 留在这张名单里：
+    // 控制台要的比对由 ?hub= 回一个布尔值，不需要把地址交出去（见下一条）。
     for (const leak of ["displayName", "capabilities", "configPath", "resources", "hubURL"]) {
       assert.equal(body[leak], undefined, `ping 不该吐 ${leak}`);
     }
+    // 没问就不答：不带 ?hub= 时连这个布尔值都不该出现，行为和加它之前一致。
+    assert.equal(body.hubMatches, undefined, "没带 ?hub= 时不该回 hubMatches");
     assert.equal(handle.token, undefined, "常驻模式不该发令牌");
+  } finally {
+    handle.close();
+    await handle.closed;
+  }
+});
+
+test("常驻模式：ping?hub= 只回比对结论，不回地址", async () => {
+  const handle = await startSetupServer({ configPath: poolFixture(), port: 0, resident: true });
+  try {
+    // poolFixture 里的 hubURL 是 http://127.0.0.1:59999。
+    // 末尾斜杠、路径这些写法差异不该影响结论 —— 比的是 origin。
+    const hit = await fetch(`http://127.0.0.1:${handle.port}/api/ping?hub=http://127.0.0.1:59999/`);
+    const hitBody = (await hit.json()) as Record<string, unknown>;
+    assert.equal(hitBody.hubMatches, true);
+    assert.equal(hitBody.hubURL, undefined, "比对成立也不该把地址带出来");
+
+    const miss = await fetch(`http://127.0.0.1:${handle.port}/api/ping?hub=https://hub.example.com`);
+    const missBody = (await miss.json()) as Record<string, unknown>;
+    assert.equal(missBody.hubMatches, false);
+    assert.equal(missBody.hubURL, undefined, "比对不成立更不该把地址带出来");
+
+    // 问一句不是 URL 的东西，只该当作没问，而不是崩掉或答 false。
+    const junk = await fetch(`http://127.0.0.1:${handle.port}/api/ping?hub=not-a-url`);
+    const junkBody = (await junk.json()) as Record<string, unknown>;
+    assert.equal(junkBody.running, true);
+    assert.equal(junkBody.hubMatches, undefined);
   } finally {
     handle.close();
     await handle.closed;

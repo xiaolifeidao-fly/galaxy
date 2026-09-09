@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { expandHome } from "../core/paths.js";
 import type { CredentialProvider, UpstreamAuthContext } from "./types.js";
+import { isClaudeSubscription } from "./claude-request.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -118,6 +119,7 @@ export const claudeOAuthProvider: CredentialProvider = {
       const creds = await getClaudeCreds(provider);
       headers.authorization = `Bearer ${creds.accessToken}`;
       betas.add("oauth-2025-04-20");
+      if (isClaudeSubscription(provider, upstream)) betas.add("claude-code-20250219");
     }
     if (betas.size) headers["anthropic-beta"] = [...betas].join(",");
     for (const name of PASSTHROUGH_HEADERS) {
