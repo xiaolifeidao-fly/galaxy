@@ -105,6 +105,8 @@ export const claudeOAuthProvider: CredentialProvider = {
     const betas = new Set((header("anthropic-beta") || "")
       .split(",").map((s) => s.trim()).filter(Boolean));
     const headers: Record<string, string> = {
+      // 本机 Claude Code 配置里要求每个请求都带的静态头（ANTHROPIC_CUSTOM_HEADERS）。
+      ...(upstream.headers ?? {}),
       "anthropic-version": header("anthropic-version") || "2023-06-01",
     };
     if (upstream.auth) {

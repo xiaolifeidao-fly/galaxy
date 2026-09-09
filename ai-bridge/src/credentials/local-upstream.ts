@@ -31,6 +31,9 @@ export interface UpstreamTarget {
   source: string;
   // 本机接中转站用的令牌。空表示用订阅登录态（凭据提供者自己去读）。
   auth?: UpstreamAuth;
+  // 本机 CLI 配置里要求每个请求都带的静态头（Codex 的 http_headers / env_http_headers，
+  // Claude Code 的 ANTHROPIC_CUSTOM_HEADERS）。中转站的鉴权常常就藏在这里。
+  headers?: Record<string, string>;
   // Codex 自定义 provider 的协议：chat 只能走 /v1/chat/completions。
   wireApi?: "responses" | "chat";
 }
@@ -55,7 +58,9 @@ export async function resolveUpstream(
 
 // ---------- Claude Code ----------
 
-const CLAUDE_ENV_KEYS = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] as const;
+const CLAUDE_ENV_KEYS = [
+  "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS",
+] as const;
 
 interface EnvLayer {
   name: string;
@@ -130,11 +135,27 @@ export async function resolveClaudeUpstream(
   }
 
   const auth = findClaudeAuth(layers);
+  const custom = layers.find((layer) => layer.env.ANTHROPIC_CUSTOM_HEADERS)?.env.ANTHROPIC_CUSTOM_HEADERS;
+  const headers = custom ? parseCustomHeaders(custom) : {};
   return {
     baseURL,
     source: `本机 Claude Code 中转（${baseLayer!.name} ANTHROPIC_BASE_URL）`,
     ...(auth ? { auth } : {}),
+    ...(Object.keys(headers).length ? { headers } : {}),
   };
+}
+
+// ANTHROPIC_CUSTOM_HEADERS 的格式是每行一个 "Name: Value"。
+function parseCustomHeaders(raw: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const line of raw.split(/\r?\n/)) {
+    const colon = line.indexOf(":");
+    if (colon <= 0) continue;
+    const name = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+    if (name && value) headers[name] = value;
+  }
+  return headers;
 }
 
 function findClaudeAuth(layers: EnvLayer[]): UpstreamAuth | undefined {
@@ -172,8 +193,11 @@ export function codexHome(authFile: string | undefined, env: NodeJS.ProcessEnv =
  * Codex 的上游读法（config.toml）：
  *
  *   model_provider = "xxx" 且 [model_providers.xxx] 有 base_url → 本机接的是中转。
- *     requires_openai_auth = true  → 中转吃 ChatGPT 登录态，头和直连官方一样；
- *     否则按 env_key 取令牌（没有 env_key 就不带鉴权）。
+ *     鉴权按 Codex 自己的优先级：
+ *       experimental_bearer_token → 静态 Bearer（常见于接另一台 ai-bridge）；
+ *       requires_openai_auth = true → ChatGPT 登录态，头和直连官方一样；
+ *       env_key → 从环境变量取 Bearer；都没有就不带鉴权。
+ *     http_headers / env_http_headers 是每个请求都带的静态头，原样跟着走。
  *     wire_api 默认 chat；只有 responses 才能承接 /v1/responses。
  *   没有自定义 provider → 订阅官方：chatgpt_base_url（默认 chatgpt.com/backend-api/）+ codex。
  */
@@ -196,7 +220,10 @@ export async function resolveCodexUpstream(
   if (providerId !== "openai" && customBase) {
     const wireApi = custom.wire_api === "responses" ? "responses" : "chat";
     let auth: UpstreamAuth | undefined;
-    if (custom.requires_openai_auth !== true) {
+    const bearer = stringOf(custom.experimental_bearer_token);
+    if (bearer) {
+      auth = { kind: "bearer", value: bearer };
+    } else if (custom.requires_openai_auth !== true) {
       const envKey = stringOf(custom.env_key);
       if (envKey) {
         const value = env[envKey]?.trim();
@@ -206,11 +233,20 @@ export async function resolveCodexUpstream(
         auth = { kind: "bearer", value };
       }
     }
+    const headers: Record<string, string> = {};
+    for (const [name, value] of Object.entries(asTable(custom.http_headers))) {
+      if (typeof value === "string" && value.trim()) headers[name.toLowerCase()] = value.trim();
+    }
+    for (const [name, envName] of Object.entries(asTable(custom.env_http_headers))) {
+      const value = typeof envName === "string" ? env[envName]?.trim() : undefined;
+      if (value) headers[name.toLowerCase()] = value;
+    }
     return {
       baseURL: trimSlash(customBase),
       source: `本机 Codex 中转（config.toml model_provider=${providerId}）`,
       wireApi,
       ...(auth ? { auth } : {}),
+      ...(Object.keys(headers).length ? { headers } : {}),
     };
   }
 

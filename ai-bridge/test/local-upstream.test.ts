@@ -76,6 +76,25 @@ base_url = "http://relay.local:8787/v1/"
   assert.match(target.source, /中转/);
 });
 
+test("Codex：experimental_bearer_token 优先于 ChatGPT 登录态；http_headers / env_http_headers 原样带上", async (t) => {
+  const home = await tempDir(t);
+  await writeFile(join(home, "config.toml"), `
+model_provider = "custom"
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://8.216.60.153:8787/v1"
+experimental_bearer_token = "bridge-token-1"
+http_headers = { "X-Team" = "galaxy" }
+env_http_headers = { "X-From-Env" = "MY_HEADER", "X-Missing" = "NOT_SET" }
+`);
+  const target = await resolveCodexUpstream({}, { CODEX_HOME: home, MY_HEADER: "env-value" });
+  assert.equal(target.baseURL, "http://8.216.60.153:8787/v1");
+  assert.deepEqual(target.auth, { kind: "bearer", value: "bridge-token-1" }, "静态令牌优先，不用 ChatGPT 登录态");
+  assert.deepEqual(target.headers, { "x-team": "galaxy", "x-from-env": "env-value" });
+});
+
 test("Codex：自定义中转不吃 OpenAI 登录态时按 env_key 取令牌，缺了要报清楚", async (t) => {
   const home = await tempDir(t);
   await writeFile(join(home, "config.toml"), `
@@ -131,14 +150,18 @@ test("Claude：settings.json 里的 ANTHROPIC_BASE_URL 是中转时用同处的�
   assert.equal(bare.baseURL, "https://api.anthropic.com/v1");
 });
 
-test("Claude：环境变量里的中转地址生效；x-api-key 与已带 /v1 的地址都认", async (t) => {
+test("Claude：环境变量里的中转地址生效；x-api-key、已带 /v1 的地址与 ANTHROPIC_CUSTOM_HEADERS 都认", async (t) => {
   const dir = await tempDir(t);
   const target = await resolveClaudeUpstream(
-    { CLAUDE_CONFIG_DIR: dir, ANTHROPIC_BASE_URL: "http://127.0.0.1:9000/v1", ANTHROPIC_API_KEY: "key-1" },
+    {
+      CLAUDE_CONFIG_DIR: dir, ANTHROPIC_BASE_URL: "http://127.0.0.1:9000/v1", ANTHROPIC_API_KEY: "key-1",
+      ANTHROPIC_CUSTOM_HEADERS: "X-Team: galaxy\nbad line\nX-Empty:  ",
+    },
     { managedSettingsPath: NO_MANAGED },
   );
   assert.equal(target.baseURL, "http://127.0.0.1:9000/v1", "不叠成 /v1/v1");
   assert.deepEqual(target.auth, { kind: "x-api-key", value: "key-1" });
+  assert.deepEqual(target.headers, { "x-team": "galaxy" });
   assert.match(target.source, /环境变量/);
 });
 

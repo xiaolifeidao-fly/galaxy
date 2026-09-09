@@ -135,16 +135,19 @@ export const codexChatGptProvider: CredentialProvider = {
   mode: "codex_chatgpt",
   supportsPath: (path) => OPENAI_PATHS.has(path),
   async headers({ principal, requestId, provider, upstream }: UpstreamAuthContext): Promise<Record<string, string>> {
+    // 本机 Codex 配置要求每个请求都带的静态头（http_headers / env_http_headers）。
+    const statics = { ...(upstream.headers ?? {}) };
     if (upstream.auth) {
-      // 本机 Codex 接的中转不吃 ChatGPT 登录态（requires_openai_auth=false）：
-      // 只带它 env_key 指定的令牌，ChatGPT 账号头一个都不发。
-      return { authorization: `Bearer ${upstream.auth.value}` };
+      // 本机 Codex 接的中转用的是静态令牌（experimental_bearer_token / env_key），
+      // 不是 ChatGPT 登录态：只带那个令牌，ChatGPT 账号头一个都不发。
+      return { ...statics, authorization: `Bearer ${upstream.auth.value}` };
     }
     const creds = await getCodexCreds(provider.authFile);
     // 单账号多人共享：session_id 必须带上调用方身份，否则两个客户端发了相同的
     // x-request-id 时会落进上游同一个 session，被后端并成一段对话（串话）。
     const sessionId = `${principal.alias}-${requestId}`.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 128);
     return {
+      ...statics,
       authorization: `Bearer ${creds.accessToken}`,
       "chatgpt-account-id": creds.accountId,
       "openai-beta": "responses=experimental",
