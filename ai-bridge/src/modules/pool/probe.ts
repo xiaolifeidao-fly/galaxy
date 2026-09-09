@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { cpus, freemem, platform, totalmem } from "node:os";
 import type { AppConfig } from "../../config/schema.js";
-import { CredentialRegistry } from "../../credentials/index.js";
+import { CredentialRegistry, resolveUpstream } from "../../credentials/index.js";
 import type { ProbeResult, Resources } from "../../business/core/index.js";
 
 // 能力探测（P-02）：看看本机有什么可以贡献。
@@ -16,17 +16,21 @@ export async function probe(cfg: AppConfig): Promise<ProbeResult> {
     if (provider.type !== "relay" || !provider.authMode) continue;
     try {
       const credential = credentials.resolve(provider);
-      // 只解析凭据，不发请求：探测不该消耗主人的额度，也不该在上游留痕迹。
+      // 只解析上游地址与凭据，不发请求：探测不该消耗主人的额度，也不该在上游留痕迹。
+      // 地址跟着本机正在用的走：接了中转站就是中转站，没接就是订阅官方。
+      const target = await resolveUpstream(provider);
       await credential.headers({
         header: () => undefined,
         principal: { alias: "probe", scopes: new Set(["*"] as const), source: "anonymous" },
         requestId: "probe",
         provider,
         providerName: name,
+        upstream: target,
       });
       capabilities.push({
         kind: "llm.chat", provider: provider.authMode, available: true,
-        detail: `providers.${name}`, upstream: name,
+        detail: `providers.${name} → ${target.baseURL}（${target.source}）`, upstream: name,
+        upstreamTarget: { baseURL: target.baseURL, source: target.source },
       });
     } catch (e) {
       capabilities.push({

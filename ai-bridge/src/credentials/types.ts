@@ -1,5 +1,6 @@
 import type { ProviderConfig } from "../config/schema.js";
 import type { Principal } from "../auth/principal.js";
+import type { UpstreamTarget } from "./local-upstream.js";
 
 // 上游凭据提供者：给一次 relay 请求算出要发给上游的鉴权/身份头。
 // 每种 authMode 一个实现；新增一种上游（比如别家订阅）= 新增一个文件并在 index.ts 注册。
@@ -11,6 +12,9 @@ export interface UpstreamAuthContext {
   requestId: string;
   provider: ProviderConfig;
   providerName: string;
+  // 这次要打的上游（resolveUpstream 的结果）。带 auth 表示本机接的是中转站、
+  // 令牌就是它，凭据提供者不再去读订阅登录态。
+  upstream: UpstreamTarget;
 }
 
 export interface CredentialProvider {

@@ -120,6 +120,8 @@ export interface ProbeResult {
     // upstream 是 providers 里的配置键。provider 只是路由键（authMode 推出来的），
     // 两个 provider 可能推出同一个路由键，落成贡献时要靠 upstream 才知道借哪一份凭据。
     upstream?: string;
+    // 这条能力实际会打到哪：本机正在用的中转站，或订阅官方。只在可用时有。
+    upstreamTarget?: { baseURL: string; source: string };
   }>;
 }
 

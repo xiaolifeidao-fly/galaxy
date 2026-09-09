@@ -42,13 +42,23 @@ retry:                           # 仅 agent 模块用；relay 不自动重试�
   maxDelayMs: 8000
 
 # 上游。type=relay 是纯透传；codex_local / claude_code_local 是本机 agent（agent 模块用）。
+#
+# 订阅登录态类（claude_oauth / codex_chatgpt）**不用写 baseURL**：地址跟着本机
+# Claude Code / Codex 正在用的上游走 ——
+#   · Claude：managed-settings.json > ~/.claude/settings.json 的 env > 环境变量里的
+#     ANTHROPIC_BASE_URL；配了中转站就打中转站（令牌取同处的 ANTHROPIC_AUTH_TOKEN /
+#     ANTHROPIC_API_KEY），没配就是 api.anthropic.com 订阅直连。
+#   · Codex：~/.codex/config.toml 的 model_provider 指向自定义 base_url 就打它
+#     （requires_openai_auth=true 仍带 ChatGPT 登录态，否则按 env_key 取令牌）；
+#     没有就是 chatgpt_base_url（默认 chatgpt.com/backend-api/）+ codex。
+# 写了 baseURL 就以它为准，不再看本机 CLI 的配置。
 providers:
   # Claude 订阅 HTTP 透传：桥接所在机器先 `claude auth login`。
   # macOS 默认读 Keychain，其它平台读 ~/.claude/.credentials.json；也可设 CLAUDE_CODE_OAUTH_TOKEN。
   relay_claude:
     type: relay
     authMode: claude_oauth
-    baseURL: "https://api.anthropic.com/v1"
+    # baseURL: "https://api.anthropic.com/v1"   # 不写 = 跟随本机 Claude Code 的上游
     # authFile: ~/.claude/.credentials.json
     concurrency: 2
     queueMaxSize: 16
@@ -57,7 +67,7 @@ providers:
   relay_codex:
     type: relay
     authMode: codex_chatgpt
-    baseURL: "https://chatgpt.com/backend-api/codex"
+    # baseURL: "https://chatgpt.com/backend-api/codex"   # 不写 = 跟随本机 Codex 的上游
     # authFile: ~/.codex/auth.json
     concurrency: 6
     queueMaxSize: 64

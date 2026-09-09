@@ -100,6 +100,10 @@ node dist/main.js start               # mode=pool 时加入共享池
 - **三维额度同时生效。** token、时长、次数任一触顶就停止接新单，在跑的跑完。
   额度以 Hub 为权威，本地配置只是申报值；主人在控制台改了以 Hub 为准。
 - **凭据不出本机。** 上游订阅登录态只在这台机器读取，Hub 与消费者永远拿不到。
+- **上游跟着本机正在用的走。** provider 不写 `baseURL` 时，Claude 按 managed-settings /
+  `~/.claude/settings.json` / 环境变量里的 `ANTHROPIC_BASE_URL`，Codex 按 `~/.codex/config.toml`
+  的 `model_provider` → `base_url`（或 `chatgpt_base_url`）决定打哪：本机接了中转站就打中转站
+  （令牌也取同处），没接就打订阅官方。写了 `baseURL` 则以它为准。每次请求重新读，改完不用重启。
 - **不留消费者内容。** 每个工作单元一个临时目录，单元结束后整个删掉；
   日志只记 requestId 与贡献 id。
 - **Hub 会抽检。** 每个贡献每天不超过 1% 的请求会被平台用自己的账号重放一次，

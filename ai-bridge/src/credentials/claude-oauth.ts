@@ -101,16 +101,23 @@ const PASSTHROUGH_HEADERS = [
 export const claudeOAuthProvider: CredentialProvider = {
   mode: "claude_oauth",
   supportsPath: (path) => ANTHROPIC_PATHS.has(path),
-  async headers({ header, provider }: UpstreamAuthContext) {
-    const creds = await getClaudeCreds(provider);
+  async headers({ header, provider, upstream }: UpstreamAuthContext) {
     const betas = new Set((header("anthropic-beta") || "")
       .split(",").map((s) => s.trim()).filter(Boolean));
-    betas.add("oauth-2025-04-20");
     const headers: Record<string, string> = {
-      authorization: `Bearer ${creds.accessToken}`,
       "anthropic-version": header("anthropic-version") || "2023-06-01",
-      "anthropic-beta": [...betas].join(","),
     };
+    if (upstream.auth) {
+      // 本机 Claude Code 接的是中转站：用它配好的令牌，不碰订阅登录态，
+      // 也不加 oauth beta —— 那个头只对 OAuth token 有意义。
+      if (upstream.auth.kind === "bearer") headers.authorization = `Bearer ${upstream.auth.value}`;
+      else headers["x-api-key"] = upstream.auth.value;
+    } else {
+      const creds = await getClaudeCreds(provider);
+      headers.authorization = `Bearer ${creds.accessToken}`;
+      betas.add("oauth-2025-04-20");
+    }
+    if (betas.size) headers["anthropic-beta"] = [...betas].join(",");
     for (const name of PASSTHROUGH_HEADERS) {
       const value = header(name);
       if (value) headers[name] = value;

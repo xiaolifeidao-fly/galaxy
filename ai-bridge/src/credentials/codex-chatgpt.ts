@@ -134,7 +134,12 @@ const OPENAI_PATHS = new Set(["/v1/responses", "/v1/chat/completions"]);
 export const codexChatGptProvider: CredentialProvider = {
   mode: "codex_chatgpt",
   supportsPath: (path) => OPENAI_PATHS.has(path),
-  async headers({ principal, requestId, provider }: UpstreamAuthContext) {
+  async headers({ principal, requestId, provider, upstream }: UpstreamAuthContext): Promise<Record<string, string>> {
+    if (upstream.auth) {
+      // 本机 Codex 接的中转不吃 ChatGPT 登录态（requires_openai_auth=false）：
+      // 只带它 env_key 指定的令牌，ChatGPT 账号头一个都不发。
+      return { authorization: `Bearer ${upstream.auth.value}` };
+    }
     const creds = await getCodexCreds(provider.authFile);
     // 单账号多人共享：session_id 必须带上调用方身份，否则两个客户端发了相同的
     // x-request-id 时会落进上游同一个 session，被后端并成一段对话（串话）。

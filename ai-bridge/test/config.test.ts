@@ -18,10 +18,19 @@ test("defaults: loopback host, auth enabled, agent disabled", () => {
   assert.equal(cfg.admin.enabled, true);
 });
 
-test("relay must reference a relay provider with baseURL", () => {
-  assert.throws(() => parseConfig({ ...base, relay: { anthropic: "local" } }), /必须是配置了 baseURL 的 relay/);
+test("relay must reference a relay provider; baseURL only optional for subscription auth modes", () => {
+  assert.throws(() => parseConfig({ ...base, relay: { anthropic: "local" } }), /必须是 relay/);
   assert.throws(() => parseConfig({ ...base, relay: { anthropic: "missing" } }), /不存在的 provider/);
   assert.throws(() => parseConfig({ ...base, relay: { enabled: true } }), /都没配/);
+  // 订阅登录态类跟随本机 CLI 的上游，可以不写 baseURL；api_key 没有参照物，必须写。
+  assert.doesNotThrow(() => parseConfig({
+    providers: { claude: { type: "relay", authMode: "claude_oauth" }, codex: { type: "relay", authMode: "codex_chatgpt" } },
+    relay: { anthropic: "claude", openai: "codex" },
+  }));
+  assert.throws(() => parseConfig({
+    providers: { gw: { type: "relay", authMode: "api_key", apiKey: "k" } },
+    relay: { openai: "gw" },
+  }), /必须配置 baseURL/);
 });
 
 test("agent routes must point at local agent providers", () => {

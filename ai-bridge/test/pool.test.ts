@@ -41,7 +41,7 @@ test("pool 模式的贡献必须指向配了 baseURL 与 authMode 的 relay prov
 
   assert.throws(
     () => parseConfig(poolConfig({ contributions: [{ ...contribution, upstream: "local" }] })),
-    /必须是配了 baseURL 的 relay/,
+    /必须是 relay/,
   );
   assert.throws(
     () => parseConfig(poolConfig({ contributions: [{ ...contribution, upstream: "missing" }] })),

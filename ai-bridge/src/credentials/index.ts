@@ -7,6 +7,10 @@ import { apiKeyProvider } from "./api-key.js";
 export type { CredentialProvider, UpstreamAuthContext } from "./types.js";
 export { getClaudeCreds, parseClaudeCredentials, claudeKeychainService } from "./claude-oauth.js";
 export { getCodexCreds, jwtExpMs } from "./codex-chatgpt.js";
+export {
+  resolveUpstream, resolveClaudeUpstream, resolveCodexUpstream, parseTomlLite,
+  type UpstreamTarget, type UpstreamAuth,
+} from "./local-upstream.js";
 
 // authMode → 实现。新增上游类型时在这里登记。
 export class CredentialRegistry {

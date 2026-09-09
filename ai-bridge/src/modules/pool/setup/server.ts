@@ -12,7 +12,7 @@ import { defaultConfigPath } from "../../../core/paths.js";
 import { loadConfig } from "../../../config/index.js";
 import type { AppConfig } from "../../../config/schema.js";
 import { probe } from "../probe.js";
-import { CredentialRegistry } from "../../../credentials/index.js";
+import { CredentialRegistry, resolveUpstream } from "../../../credentials/index.js";
 import { toolStatuses, upgradeTool } from "../tools.js";
 import { HubClient } from "../client.js";
 import { fingerprint, readNodeIdentity, resolveNodeTokenFile, writeNodeIdentity } from "../token.js";
@@ -340,6 +340,7 @@ export async function startSetupServer(options: SetupOptions = {}): Promise<Setu
           requestId: "upstream-login",
           provider,
           providerName: name,
+          upstream: await resolveUpstream(provider),
         });
         res.json({ command: argv.join(" "), launched: false, alreadyAuthorized: true });
         return;

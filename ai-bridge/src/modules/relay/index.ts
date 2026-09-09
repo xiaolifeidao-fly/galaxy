@@ -5,6 +5,7 @@ import { getPrincipal } from "../../auth/principal.js";
 import { beginRequest } from "../../core/request.js";
 import { proxyRelay } from "../../core/proxy.js";
 import { describeError, httpError } from "../../core/errors.js";
+import { resolveUpstream } from "../../credentials/index.js";
 
 // relay 模块：把 Anthropic Messages / OpenAI Responses / Chat Completions 原样转发到
 // 用订阅登录态鉴权的上游。桥接不解析请求体、不执行工具。
@@ -56,18 +57,28 @@ export function makeRelayHandler(ctx: BridgeContext, path: string, spec: PathSpe
         throw httpError(404, "relay_not_configured", `relay.${spec.family} 未配置，${path} 不可用`);
       }
       const pc = ctx.cfg.providers[providerName];
-      if (!pc || pc.type !== "relay" || !pc.baseURL) {
-        throw httpError(500, "relay_misconfigured", `provider "${providerName}" 不存在或缺 baseURL`);
+      if (!pc || pc.type !== "relay") {
+        throw httpError(500, "relay_misconfigured", `provider "${providerName}" 不存在或不是 relay`);
       }
 
       const credential = ctx.credentials.resolve(pc);
       if (!credential.supportsPath(path)) {
         throw httpError(400, "unsupported_protocol", `authMode=${credential.mode} 不支持 ${path}`);
       }
+      // 上游跟着本机正在用的走：接了中转站就打中转站，没接就打订阅官方。
+      let upstream;
+      try {
+        upstream = await resolveUpstream(pc);
+      } catch (e) {
+        throw httpError(502, "relay_upstream_unresolved", (e as Error)?.message ?? "无法确定上游地址");
+      }
+      if (upstream.wireApi === "chat" && path === "/v1/responses") {
+        throw httpError(400, "unsupported_protocol", `本机 Codex 中转的 wire_api 是 chat，承接不了 ${path}`);
+      }
       let authHeaders: Record<string, string>;
       try {
         authHeaders = await credential.headers({
-          header: (name) => req.header(name), principal, requestId, provider: pc, providerName,
+          header: (name) => req.header(name), principal, requestId, provider: pc, providerName, upstream,
         });
       } catch (e) {
         throw httpError(502, "relay_auth_failed", (e as Error)?.message ?? "relay auth failed");
@@ -84,11 +95,12 @@ export function makeRelayHandler(ctx: BridgeContext, path: string, spec: PathSpe
       const startedAt = Date.now();
       ctx.log.info("relay_start", {
         requestId, alias: principal.alias, provider: providerName, authMode: credential.mode, path,
+        upstream: upstream.baseURL,
         model: typeof req.body?.model === "string" ? req.body.model : undefined,
         stream: req.body?.stream === true,
       });
       const { status } = await proxyRelay({
-        req, res, baseURL: pc.baseURL, authHeaders, signal, requestId,
+        req, res, baseURL: upstream.baseURL, authHeaders, signal, requestId,
         idleTimeoutMs: ctx.cfg.server.streamIdleTimeoutMs,
       });
       ctx.log.info("relay_done", { requestId, alias: principal.alias, status, ms: Date.now() - startedAt });

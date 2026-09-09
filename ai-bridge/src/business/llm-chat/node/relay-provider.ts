@@ -3,7 +3,7 @@ import type {
 } from "../../core/index.js";
 import { inlineInput, inlineJSON, inlineText } from "../../core/index.js";
 import type { ProviderConfig } from "../../../config/schema.js";
-import type { CredentialRegistry } from "../../../credentials/index.js";
+import { resolveUpstream, type CredentialRegistry } from "../../../credentials/index.js";
 import type { Principal } from "../../../auth/principal.js";
 import { cpus, freemem, totalmem, platform } from "node:os";
 
@@ -36,7 +36,7 @@ export class RelayProvider implements Provider {
   async probe(): Promise<{ resources: Resources; upstreamOK: boolean; detail?: string }> {
     const resources = localResources();
     try {
-      // 只解析凭据，不发请求：探测不该消耗主人的额度，也不该在上游留下痕迹。
+      // 只解析上游与凭据，不发请求：探测不该消耗主人的额度，也不该在上游留下痕迹。
       const credential = this.options.credentials.resolve(this.options.provider);
       await credential.headers({
         header: () => undefined,
@@ -44,6 +44,7 @@ export class RelayProvider implements Provider {
         requestId: "probe",
         provider: this.options.provider,
         providerName: this.options.name,
+        upstream: await resolveUpstream(this.options.provider),
       });
       return { resources, upstreamOK: true };
     } catch (e) {
@@ -61,10 +62,6 @@ export class RelayProvider implements Provider {
     }
 
     const config = this.options.provider;
-    if (!config.baseURL) {
-      yield { type: "error", class: "node_fault", code: "capability_mismatch", retryable: true, message: `provider ${this.options.name} 缺少 baseURL` };
-      return;
-    }
     const credential = this.options.credentials.resolve(config);
     // 收单侧再校验一次：Hub 是路由权威，但本机执行边界由本机自己守（原则 8）。
     if (!credential.supportsPath(path)) {
@@ -72,8 +69,17 @@ export class RelayProvider implements Provider {
       return;
     }
 
+    // 上游跟着本机正在用的走：接了中转站就打中转站，没接就打订阅官方。
+    // 每个单元重新解析，主人改完 CLI 配置不用重启桥接。
     let authHeaders: Record<string, string>;
+    let baseURL: string;
     try {
+      const upstream = await resolveUpstream(config);
+      if (upstream.wireApi === "chat" && path === "/v1/responses") {
+        yield { type: "error", class: "node_fault", code: "capability_mismatch", retryable: true, message: `本机 Codex 中转的 wire_api 是 chat，承接不了 ${path}` };
+        return;
+      }
+      baseURL = upstream.baseURL;
       authHeaders = await credential.headers({
         header: (name) => clientHeaders[name.toLowerCase()] ?? clientHeaders[name],
         // 消费者对节点是匿名的：这里只有 ck_… 这个匿名标识，没有任何身份信息（C-12）。
@@ -81,6 +87,7 @@ export class RelayProvider implements Provider {
         requestId: unit.id,
         provider: config,
         providerName: this.options.name,
+        upstream,
       });
     } catch (e) {
       // 凭据失效：这条贡献要标成 upstreamOK=false 并通知主人（P-12）。
@@ -95,7 +102,7 @@ export class RelayProvider implements Provider {
     else io.signal.addEventListener("abort", onAbort, { once: true });
 
     try {
-      const url = config.baseURL.replace(/\/+$/, "") + path.replace(/^\/v1(?=\/)/, "");
+      const url = baseURL + path.replace(/^\/v1(?=\/)/, "");
       const upstream = await fetch(url, {
         method: "POST",
         headers: {
@@ -124,7 +131,7 @@ export class RelayProvider implements Provider {
           yield { type: "chunk", bytes: value };
         }
       }
-      io.log("relay_upstream_done", { status: upstream.status, bytes });
+      io.log("relay_upstream_done", { status: upstream.status, bytes, url });
       // usage 交给 Hub 从流里解析。节点这里不重复解析一遍：
       // 自报值只用于对账，多算一次也不会更可信。
       yield { type: "done", usage: {} as Metering };

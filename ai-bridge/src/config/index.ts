@@ -18,6 +18,25 @@ function expandEnv(obj: unknown, env: NodeJS.ProcessEnv): unknown {
   return obj;
 }
 
+// 订阅登录态类的 provider 可以不写 baseURL：地址跟着本机 Claude Code / Codex
+// 正在用的上游走（中转站或官方），见 credentials/local-upstream.ts。
+// api_key 没有这种「本机正在用的」参照物，必须显式写。
+function needsExplicitBaseURL(authMode: string | undefined): boolean {
+  return authMode !== "claude_oauth" && authMode !== "codex_chatgpt";
+}
+
+function assertRelayProvider(who: string, name: string, p: AppConfig["providers"][string]): void {
+  if (p.type !== "relay") {
+    throw new Error(`${who} 引用的 provider "${name}" 必须是 relay（当前 type=${p.type}）`);
+  }
+  if (!p.baseURL && needsExplicitBaseURL(p.authMode)) {
+    throw new Error(
+      `${who} 引用的 provider "${name}" 是 authMode=${p.authMode ?? "api_key"}，必须配置 baseURL` +
+      "（只有 claude_oauth / codex_chatgpt 可以省略，自动跟随本机 CLI 的上游）",
+    );
+  }
+}
+
 // 配置文件之外的一致性校验：引用的 provider 必须存在且类型对得上。
 export function validateConfig(cfg: AppConfig): AppConfig {
   const relayTargets: Array<[string, string | undefined]> = [
@@ -28,9 +47,7 @@ export function validateConfig(cfg: AppConfig): AppConfig {
     if (!name) continue;
     const p = cfg.providers[name];
     if (!p) throw new Error(`${field} 引用了不存在的 provider "${name}"`);
-    if (p.type !== "relay" || !p.baseURL) {
-      throw new Error(`${field} 引用的 provider "${name}" 必须是配置了 baseURL 的 relay`);
-    }
+    assertRelayProvider(field, name, p);
   }
   if (cfg.relay.enabled && !cfg.relay.anthropic && !cfg.relay.openai) {
     throw new Error("relay.enabled=true 但 relay.anthropic / relay.openai 都没配");
@@ -56,9 +73,7 @@ export function validateConfig(cfg: AppConfig): AppConfig {
       if (c.upstream) {
         const p = cfg.providers[c.upstream];
         if (!p) throw new Error(`贡献 "${c.id}" 引用了不存在的 provider "${c.upstream}"`);
-        if (p.type !== "relay" || !p.baseURL) {
-          throw new Error(`贡献 "${c.id}" 引用的 provider "${c.upstream}" 必须是配了 baseURL 的 relay`);
-        }
+        assertRelayProvider(`贡献 "${c.id}"`, c.upstream, p);
         if (!p.authMode) {
           throw new Error(`贡献 "${c.id}" 引用的 provider "${c.upstream}" 缺少 authMode，无法推出路由键`);
         }

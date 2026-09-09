@@ -15,6 +15,10 @@ export const AuthModeSchema = z.enum(["codex_chatgpt", "claude_oauth", "api_key"
 export const ProviderConfigSchema = z.object({
   type: ProviderTypeSchema,
   apiKey: z.string().optional(),
+  // 上游地址。claude_oauth / codex_chatgpt 可以不写：跟着本机 Claude Code / Codex
+  // 正在用的上游走 —— 本机接了中转站就打中转站，没接就打订阅官方
+  //（见 credentials/local-upstream.ts）。写了就是主人的明确决定，以它为准。
+  // api_key 必须写。
   baseURL: z.string().url().optional(),
   authMode: AuthModeSchema.optional(),
   // codex_chatgpt: auth.json 路径；claude_oauth: .credentials.json 路径

@@ -1,5 +1,5 @@
 import type { ProviderConfig } from "../../config/schema.js";
-import type { CredentialRegistry } from "../../credentials/index.js";
+import { resolveUpstream, type CredentialRegistry } from "../../credentials/index.js";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -62,12 +62,12 @@ export async function listModels(
     if (cached.length) return cached;
   }
 
-  if (!provider.baseURL) return [];
-
   const hit = cache.get(name);
   if (hit && Date.now() - hit.at < hit.ttl) return [...hit.models];
 
   try {
+    // 上游跟着本机正在用的走（中转站或订阅官方），/models 也打同一个地方。
+    const upstream = await resolveUpstream(provider);
     const credential = credentials.resolve(provider);
     const headers = await credential.headers({
       header: () => undefined,
@@ -75,8 +75,9 @@ export async function listModels(
       requestId: "models",
       provider,
       providerName: name,
+      upstream,
     });
-    const url = new URL(`${provider.baseURL.replace(/\/+$/, "")}/models`);
+    const url = new URL(`${upstream.baseURL}/models`);
     if (provider.authMode === "codex_chatgpt") {
       url.searchParams.set("client_version", provider.modelsClientVersion ?? DEFAULT_CODEX_CLIENT_VERSION);
     }
