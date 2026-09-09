@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseConfig } from "../src/config/index.js";
 import { Lane } from "../src/modules/pool/lane.js";
-import { sleep } from "../src/modules/pool/runner.js";
+import { healthSignature, sleep } from "../src/modules/pool/runner.js";
 import { parseModels } from "../src/modules/pool/models.js";
 import { modelMatch, inlineJSON, inlineText, type WorkUnit } from "../src/business/core/index.js";
 import type { ContributionDeclaration } from "../src/modules/pool/client.js";
@@ -268,4 +268,36 @@ test("认不出来的形状一律当空，不猜", () => {
 
 test("丢掉空串和非字符串的 id", () => {
   assert.deepEqual(parseModels({ data: [{ id: "" }, { id: "  " }, { id: 5 }, { id: "ok" }] }), ["ok"]);
+});
+
+// ---------- 能力健康指纹 ----------
+//
+// 节点每分钟重探一次本机能力，只在指纹变了的时候重发 hello。
+// 这是「运行中登录态过期 / 登录回来」能被 Hub 看见的唯一途径 ——
+// 在此之前 available 只在启动时上报一次，中途变化平台完全不知道。
+
+const report = (cid: string, available: boolean, unavailableReason?: string) =>
+  ({ cid, kind: "llm.chat", kindVersion: 1, provider: "p", available, unavailableReason }) as never;
+
+test("可用性翻转时指纹必须变，否则 Hub 永远拿着过时状态", () => {
+  const before = healthSignature([report("relay_claude", false, "登录态缺失"), report("relay_codex", true)]);
+  const after = healthSignature([report("relay_claude", true), report("relay_codex", true)]);
+  assert.notEqual(before, after, "登录回来了却判成没变，主人得重启节点才恢复");
+});
+
+test("原因变了也算变：处置建议不同，界面那句话必须跟着换", () => {
+  const a = healthSignature([report("relay_claude", false, "登录态缺失")]);
+  const b = healthSignature([report("relay_claude", false, "登录态已过期")]);
+  assert.notEqual(a, b);
+});
+
+test("顺序不影响指纹：探测返回顺序变了不该触发一次无谓的 hello", () => {
+  const a = healthSignature([report("x", true), report("y", false, "r")]);
+  const b = healthSignature([report("y", false, "r"), report("x", true)]);
+  assert.equal(a, b);
+});
+
+test("完全没变时指纹相同", () => {
+  const rows = [report("x", true), report("y", false, "r")];
+  assert.equal(healthSignature(rows), healthSignature([...rows]));
 });

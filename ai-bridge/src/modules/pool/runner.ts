@@ -27,6 +27,18 @@ import { fingerprint, readNodeIdentity, resolveNodeTokenFile } from "./token.js"
 // 心跳线程每 15s 一次，取消信号搭在这两条已有链路上，不单独轮询（T-05）。
 
 const RECONNECT_MIN_MS = 1_000;
+/**
+ * 重探本机能力的间隔。
+ *
+ * 能力可用性只在 hello 时上报，而 hello 只在启动/重连时发生 —— 于是「运行中
+ * 登录态过期」和「运行中登录回来」这两件事 Hub 都看不见：前者会让它继续把请求
+ * 派到一个用不了的上游，后者会让主人登录完还得等下一次重启才恢复。
+ * 这个循环把两边都补上：探到变化就主动重发一次 hello。
+ *
+ * 60 秒是折中 —— 探测要读 Keychain、还要起一次 ffmpeg -version，不是白拿的，
+ * 但恢复延迟也不该长到让人以为没生效。
+ */
+const HEALTH_PROBE_MS = 60_000;
 const RECONNECT_MAX_MS = 30_000;
 
 export interface PoolRunner {
@@ -139,8 +151,35 @@ export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
     }
   }
 
-  async function sayHello(): Promise<void> {
-    const reports = await refreshInventory();
+  // 上一次成功上报出去的能力健康状况。healthLoop 靠它判断「变了没有」。
+  let lastHealth = "";
+
+  /**
+   * 定期重探，只在**变了**的时候重发 hello。
+   *
+   * 不是每次都发：hello 会让 Hub 做一次全量 inventory 同步，没变化时发它纯属浪费。
+   */
+  async function healthLoop(): Promise<void> {
+    while (!stopping) {
+      await sleep(HEALTH_PROBE_MS);
+      if (stopping) break;
+      try {
+        const reports = await refreshInventory();
+        if (healthSignature(reports) === lastHealth) continue;
+        log.info("pool_health_changed", {
+          unavailable: reports.filter((r) => !r.available).map((r) => r.cid),
+        });
+        await sayHello(reports);
+      } catch (e) {
+        log.warn("pool_health_probe_failed", { message: (e as Error)?.message });
+      }
+    }
+  }
+
+  // reports 传进来就直接用，不再探一遍 —— healthLoop 刚探完，重复探一次
+  // 既慢又可能拿到不一致的两份结果。
+  async function sayHello(reports?: CapabilityReport[]): Promise<void> {
+    reports = reports ?? (await refreshInventory());
     const result = await client.hello({
       bridgeVersion,
       contract: settings.contract,
@@ -151,6 +190,7 @@ export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
       log.error("pool_capability_rejected", { cid: rejected.cid, reason: rejected.reason });
     }
     applyEnabled(result.enabled);
+    lastHealth = healthSignature(reports);
     log.info("pool_hello", {
       nodeId: identity.nodeId, token: fingerprint(identity.token),
       probed: reports.length, enabled: lanes.size, hub: settings.hubURL,
@@ -404,6 +444,7 @@ export async function createPoolRunner(cfg: AppConfig): Promise<PoolRunner> {
       }
       void heartbeatLoop();
       void nextLoop();
+      void healthLoop();
       log.info("pool_started", { nodeId: identity.nodeId, lanes: [...lanes.keys()] });
     },
     async stop() {
@@ -580,6 +621,22 @@ async function readVersion(): Promise<string> {
  *
  * 停止不靠事件循环耗尽，靠 stop() 里的 abort + 显式 process.exit。
  */
+/**
+ * 能力健康的指纹：cid + 可用与否 + 原因。任何一项变化都值得重发一次 hello。
+ *
+ * 导出是为了能单测。写错的后果是安静的：漏判变化 → Hub 一直拿着过时的可用性，
+ * 会把请求派给用不了的上游；误判变化 → 每分钟白发一次 hello。两种都不报错。
+ *
+ * 原因也参与比较：同一个 cid 从「登录态缺失」变成「登录态已过期」，对主人是
+ * 不同的处置建议，界面上那句话必须跟着变。
+ */
+export function healthSignature(reports: CapabilityReport[]): string {
+  return reports
+    .map((r) => `${r.cid}:${r.available ? 1 : 0}:${r.unavailableReason ?? ""}`)
+    .sort()
+    .join("|");
+}
+
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
