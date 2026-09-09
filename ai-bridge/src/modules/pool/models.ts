@@ -1,6 +1,10 @@
 import type { ProviderConfig } from "../../config/schema.js";
 import type { CredentialRegistry } from "../../credentials/index.js";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { log } from "../../core/logger.js";
+import { expandHome } from "../../core/paths.js";
 
 /**
  * 上游可用模型清单。
@@ -51,6 +55,13 @@ export async function listModels(
 ): Promise<string[]> {
   // 配置里声明了就以它为准，一次上游都不打。
   if (provider.models?.length) return [...provider.models];
+
+  // Codex 优先读 CLI 自己的本地缓存，见 codexCachedModels 的说明。
+  if (provider.authMode === "codex_chatgpt") {
+    const cached = await codexCachedModels(provider);
+    if (cached.length) return cached;
+  }
+
   if (!provider.baseURL) return [];
 
   const hit = cache.get(name);
@@ -102,4 +113,63 @@ export function parseModels(payload: unknown): string[] {
     if (typeof id === "string" && id.trim()) out.push(id.trim());
   }
   return [...new Set(out)].sort();
+}
+
+/**
+ * 读 Codex CLI 自己维护的模型缓存（`~/.codex/models_cache.json`）。
+ *
+ * 为什么不走 HTTP：`chatgpt.com/backend-api/codex/models` 返回的**不是**客户端
+ * 模型选择器那份清单 —— 实测它少了 gpt-6-astra、gpt-5.6-sol、gpt-5.4-mini，
+ * 却多出 gpt-reserve、codex-auto-review 这两个非对话项。选择器那份是 CLI 自己
+ * 拉下来缓存在本地的，这里直接读它，和用户在 codex 里 `/model` 看到的完全一致。
+ *
+ * `visibility` 就是选择器的过滤依据：`list` 才显示，`hide` 的是内部用途。
+ * 按 `priority` 升序排，和选择器里的顺序一致（数字小的在前）。
+ *
+ * 读不到就返回空，调用方退回 HTTP 那条路 —— 没装 CLI、或者还没跑过一次
+ * （缓存还没生成）的机器仍然有个兜底。
+ */
+async function codexCachedModels(provider: ProviderConfig): Promise<string[]> {
+  // authFile 指到哪儿，缓存就在它旁边；没配就走默认的 CODEX_HOME / ~/.codex。
+  const home = provider.authFile
+    ? dirname(expandHome(provider.authFile))
+    : process.env.CODEX_HOME
+      ? expandHome(process.env.CODEX_HOME)
+      : join(homedir(), ".codex");
+  try {
+    const listed = parseCodexCache(await readFile(join(home, "models_cache.json"), "utf8"));
+    if (listed.length) log.info("pool_models_from_codex_cache", { count: listed.length });
+    return listed;
+  } catch {
+    // 没装 CLI、没跑过、或者格式变了：交给调用方退回 HTTP。
+    return [];
+  }
+}
+
+/**
+ * 从 models_cache.json 里挑出用户能选的模型。
+ *
+ * 导出是为了能单测。两条判据都不能少：
+ *   · visibility === "list" —— `hide` 的是内部用途（gpt-reserve、codex-auto-review），
+ *     放进候选项只会让主人配出一条本不该有的规则；
+ *   · 按 priority 升序 —— 和 CLI 选择器里的顺序一致，主人对得上号。
+ *
+ * 格式变了就返回空，交给调用方退回 HTTP。这是别人家的私有缓存格式，
+ * 哪天字段改名不该让整条能力探测跟着挂。
+ */
+export function parseCodexCache(raw: string): string[] {
+  let rows: unknown;
+  try {
+    rows = (JSON.parse(raw) as { models?: unknown }).models;
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .filter((row): row is { slug: string; priority?: number; visibility?: string } => {
+      const item = row as { slug?: unknown; visibility?: unknown } | null;
+      return typeof item?.slug === "string" && item.slug.trim() !== "" && item.visibility === "list";
+    })
+    .sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0))
+    .map((row) => row.slug.trim());
 }

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { parseConfig } from "../src/config/index.js";
 import { Lane } from "../src/modules/pool/lane.js";
 import { healthSignature, sleep } from "../src/modules/pool/runner.js";
-import { parseModels } from "../src/modules/pool/models.js";
+import { parseCodexCache, parseModels } from "../src/modules/pool/models.js";
 import { parseVersion } from "../src/modules/pool/tools.js";
 import { modelMatch, inlineJSON, inlineText, type WorkUnit } from "../src/business/core/index.js";
 import type { ContributionDeclaration } from "../src/modules/pool/client.js";
@@ -325,5 +325,40 @@ test("认不出来返回空串，绝不瞎猜", () => {
   // 比显示一个猜来的版本号安全。
   for (const junk of ["", "unknown", "命令未找到", "codex-cli"]) {
     assert.equal(parseVersion(junk), "", `不该从 ${JSON.stringify(junk)} 解析出版本`);
+  }
+});
+
+// ---------- Codex 本地模型缓存 ----------
+//
+// Codex 的 /models HTTP 端点返回的**不是**客户端选择器那份清单（少 3 个、多 2 个
+// 内部项）。真正的来源是 CLI 自己缓存的 ~/.codex/models_cache.json。
+// 这里钉住两条判据：只要 visibility=list，按 priority 排。
+
+const cache = (models: unknown[]) => JSON.stringify({ models });
+
+test("只取 visibility=list，hide 的内部模型不能进候选项", () => {
+  // gpt-reserve / codex-auto-review 在真实缓存里就是 hide —— 放进去主人会照着
+  // 配出一条指向内部模型的规则，而那本不该被共享出去。
+  const raw = cache([
+    { slug: "gpt-6-astra", visibility: "list", priority: 1 },
+    { slug: "gpt-reserve", visibility: "hide", priority: 3 },
+    { slug: "codex-auto-review", visibility: "hide", priority: 43 },
+  ]);
+  assert.deepEqual(parseCodexCache(raw), ["gpt-6-astra"]);
+});
+
+test("按 priority 升序，和 CLI 选择器里的顺序一致", () => {
+  const raw = cache([
+    { slug: "gpt-5.4-mini", visibility: "list", priority: 23 },
+    { slug: "gpt-6-astra", visibility: "list", priority: 1 },
+    { slug: "gpt-5.6-terra", visibility: "list", priority: 7 },
+  ]);
+  assert.deepEqual(parseCodexCache(raw), ["gpt-6-astra", "gpt-5.6-terra", "gpt-5.4-mini"]);
+});
+
+test("格式变了或读到垃圾一律返回空，不抛 —— 交给调用方退回 HTTP", () => {
+  for (const junk of ["", "not json", "{}", '{"models":"nope"}', '{"models":[{"slug":123}]}',
+                      '{"models":[{"slug":"x"}]}']) {
+    assert.deepEqual(parseCodexCache(junk), [], `不该从 ${junk} 解析出模型`);
   }
 });
